@@ -35,30 +35,6 @@ pub fn build(b: *std.Build) void {
     const module_tests = b.addTest(.{ .root_module = mod });
     test_step.dependOn(&b.addRunArtifact(module_tests).step);
 
-    const examples_step = b.step("examples", "Build every example");
-    b.getInstallStep().dependOn(examples_step);
-    for (zigFilesIn(b, "examples")) |name| {
-        const stem = name[0 .. name.len - ".zig".len];
-        const exe = b.addExecutable(.{
-            .name = stem,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(b.fmt("examples/{s}", .{name})),
-                .imports = &.{
-                    .{ .name = "lenore-gltf", .module = mod },
-                    .{ .name = "lenore-resources", .module = resource.module("lenore-resources") },
-                    .{ .name = "zmath", .module = zmath },
-                },
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
-
-        const run = b.addRunArtifact(exe);
-        if (b.args) |args| run.addArgs(args);
-        b.step(b.fmt("run-{s}", .{stem}), b.fmt("Run the {s} example", .{stem}))
-            .dependOn(&run.step);
-    }
 }
 
 fn zigFilesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {

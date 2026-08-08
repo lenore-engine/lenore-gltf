@@ -503,11 +503,26 @@ const NodeSlots = struct {
 // it. Null for a document with no clips or nothing dynamic to drive, which costs
 // a purely static asset nothing.
 //
+// `node_to_slot` is dense over the document's nodes and is the caller's only way
+// back from a node index to the slot whose world transform moves it. The slot
+// space is not derived from the node space by any rule a caller could reproduce,
+// since it counts only the slotted nodes the default scene reaches.
+//
+// It is cleared here rather than by the caller, so a document with nothing to
+// drive leaves it all null instead of leaving whatever was in it.
+//
 // The returned template owns its arrays. resources.NodeTemplate.init takes them
 // over from the call, including on failure, so there is no half-owned state to
 // unwind here.
-pub fn parseNodeAnimation(allocator: Allocator, doc: *const Document) Error!?NodeTemplate {
-    const assembled = (try assembleNodeAnimation(allocator, doc)) orelse return null;
+pub fn parseNodeAnimation(
+    allocator: Allocator,
+    doc: *const Document,
+    node_to_slot: []?Slot,
+) Error!?NodeTemplate {
+    std.debug.assert(node_to_slot.len == doc.nodes.len);
+    @memset(node_to_slot, null);
+
+    const assembled = (try assembleNodeAnimation(allocator, doc, node_to_slot)) orelse return null;
     return try NodeTemplate.init(allocator, assembled);
 }
 
@@ -515,7 +530,11 @@ pub fn parseNodeAnimation(allocator: Allocator, doc: *const Document) Error!?Nod
 // errdefer here has either fired or been discharged by the time this returns, so
 // NodeTemplate.init receives arrays nothing else will free, which matters
 // because init takes them over on its own failure too.
-fn assembleNodeAnimation(allocator: Allocator, doc: *const Document) Error!?NodeTemplate {
+fn assembleNodeAnimation(
+    allocator: Allocator,
+    doc: *const Document,
+    node_to_slot: []?Slot,
+) Error!?NodeTemplate {
     if (doc.animations.len == 0) return null;
 
     var info = try dynamic_nodes.collect(allocator, doc);
@@ -525,12 +544,6 @@ fn assembleNodeAnimation(allocator: Allocator, doc: *const Document) Error!?Node
     for (defaultSceneRoots(doc)) |root| slot_count += countSlotted(doc, &info.slotted, root);
     if (slot_count == 0) return null;
     if (slot_count > resources.max_slots) return error.TooManySlots;
-
-    // Scratch: the template addresses slots, and only the importer needs to know
-    // which node became which slot.
-    const node_to_slot = try allocator.alloc(?Slot, doc.nodes.len);
-    defer allocator.free(node_to_slot);
-    @memset(node_to_slot, null);
 
     const parent = try allocator.alloc(Slot, slot_count);
     errdefer allocator.free(parent);

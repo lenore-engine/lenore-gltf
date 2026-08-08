@@ -73,11 +73,11 @@ fn expectVec3(expected: [3]f32, actual: resources.Vec3) !void {
         try testing.expectApproxEqAbs(expected[lane], actual[lane], 1e-5);
 }
 
-// Finds the mesh a node produced, since merged groups come after the separate
-// ones and neither order is part of the contract.
-fn meshOf(model: importer.Model, node: ?u32) importer.Mesh {
+// Finds a mesh by the material it draws with, since merged groups come after the
+// separate ones and neither order is part of the contract.
+fn meshOf(model: importer.Model, material: u32) importer.Mesh {
     for (model.meshes) |mesh| {
-        if (mesh.source_node == node) return mesh;
+        if (mesh.material == material) return mesh;
     }
     unreachable;
 }
@@ -123,8 +123,7 @@ test "importer: two nodes of one mesh merge into one draw, baked into place" {
 
     try testing.expectEqual(@as(usize, 1), model.meshes.len);
     const merged = model.meshes[0];
-    try testing.expectEqual(@as(?u32, null), merged.source_node);
-    try testing.expectEqual(@as(?u32, null), merged.anchor);
+    try testing.expectEqual(@as(?resources.Slot, null), merged.anchor);
     try testing.expectEqual(@as(usize, 6), merged.vertices.len);
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5 }, merged.indices);
 
@@ -157,7 +156,7 @@ test "importer: blended geometry is never merged" {
     // It is still baked, only not merged.
     try expectVec3(.{ 0, 0, 7 }, blended.vertices[0].position);
 
-    const opaque_mesh = meshOf(model, null);
+    const opaque_mesh = meshOf(model, 0);
     try testing.expectEqual(@as(usize, 3), opaque_mesh.vertices.len);
 }
 
@@ -177,7 +176,8 @@ test "importer: a morph primitive keeps its own buffers and its deltas follow" {
 
     try testing.expectEqual(@as(usize, 1), model.meshes.len);
     const mesh = model.meshes[0];
-    try testing.expectEqual(@as(?u32, 0), mesh.source_node);
+    // A morphed primitive carries the weights of the node that instantiated it.
+    try testing.expectEqual(@as(?u32, 0), mesh.morph_template);
 
     const morph = mesh.morph orelse return error.TestExpectedMorph;
     try testing.expectEqual(@as(u32, 1), morph.target_count);
@@ -206,7 +206,7 @@ test "importer: skinned geometry stays in its own space" {
     try testing.expectEqual(@as(usize, 1), model.meshes.len);
     const mesh = model.meshes[0];
     try testing.expectEqual(@as(?u32, 0), mesh.skin);
-    try testing.expectEqual(@as(?u32, null), mesh.anchor);
+    try testing.expectEqual(@as(?resources.Slot, null), mesh.anchor);
     try testing.expect(mesh.streams.skinned);
     // The node's translation is not baked in: the joint matrices carry it, and
     // baking would apply it twice.
@@ -241,7 +241,7 @@ test "importer: a skinned mesh on a driven node takes no anchor" {
 
     try testing.expectEqual(@as(usize, 1), model.meshes.len);
     try testing.expectEqual(@as(?u32, 0), model.meshes[0].skin);
-    try testing.expectEqual(@as(?u32, null), model.meshes[0].anchor);
+    try testing.expectEqual(@as(?resources.Slot, null), model.meshes[0].anchor);
 }
 
 test "importer: an image is named, and only an embedded one is read" {
@@ -316,7 +316,7 @@ test "importer: a light carries the transform of the node that references it" {
     try testing.expectApproxEqAbs(@as(f32, 4.0), world[3][1], 1e-5);
 }
 
-test "importer: a morph clip carries the pose the mesh declares" {
+test "importer: a morph template carries the pose the mesh declares" {
     var doc = try load(
         \\ "meshes":[{"weights":[0.25],
         \\            "primitives":[{"attributes":{"POSITION":0},
@@ -331,12 +331,120 @@ test "importer: a morph clip carries the pose the mesh declares" {
     var model = try importer.build(testing.allocator, &doc, "");
     defer model.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), model.morph_clips.len);
-    const clip = model.morph_clips[0];
-    try testing.expectEqual(@as(u32, 0), clip.node);
-    try testing.expectEqual(@as(u32, 1), clip.target_count);
-    // Section 3.7.2.2 makes the mesh's weights the pose before any clip plays.
-    try testing.expectEqualSlices(f32, &.{0.25}, clip.defaults);
+    try testing.expectEqual(@as(usize, 1), model.morph_templates.len);
+    const template = model.morph_templates[0];
+    try testing.expectEqual(@as(usize, 1), template.clips.len);
+    // Section 3.7.4 makes the mesh's weights the pose before any clip plays.
+    try testing.expectEqualSlices(f32, &.{0.25}, template.defaults);
+    try testing.expectEqual(@as(?u32, 0), model.meshes[0].morph_template);
+}
+
+test "importer: a mesh with no morph targets gets no template" {
+    // The list is walked per node rather than per weight channel, so a document
+    // with animations but no targets has to come back empty.
+    var doc = try load(one_triangle ++
+        \\ "nodes":[{"mesh":0}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "animations":[{"samplers":[{"input":1,"output":2}],
+        \\                "channels":[{"sampler":0,"target":{"node":0,"path":"translation"}}]}]}
+    );
+    defer doc.deinit();
+
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 0), model.morph_templates.len);
+    try testing.expectEqual(@as(?u32, null), model.meshes[0].morph_template);
+}
+
+test "importer: the node's weights win over the mesh's" {
+    // Section 3.7.4 states the precedence, and an asset that declares both is
+    // the only place the two can be told apart.
+    var doc = try load(
+        \\ "meshes":[{"weights":[0.25],
+        \\            "primitives":[{"attributes":{"POSITION":0},
+        \\                           "targets":[{"POSITION":3}]}]}],
+        \\ "nodes":[{"mesh":0,"weights":[0.75]}],
+        \\ "scenes":[{"nodes":[0]}]}
+    );
+    defer doc.deinit();
+
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), model.morph_templates.len);
+    try testing.expectEqualSlices(f32, &.{0.75}, model.morph_templates[0].defaults);
+}
+
+test "importer: a morphed mesh with no animation still gets its pose" {
+    // The shape MorphPrimitivesTest has: static weights and no animation at all.
+    // Building templates from the animations alone would leave this mesh blended
+    // by nothing and drawn unmorphed.
+    var doc = try load(
+        \\ "meshes":[{"weights":[0.5],
+        \\            "primitives":[{"attributes":{"POSITION":0},
+        \\                           "targets":[{"POSITION":3}]}]}],
+        \\ "nodes":[{"mesh":0}],
+        \\ "scenes":[{"nodes":[0]}]}
+    );
+    defer doc.deinit();
+
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), model.morph_templates.len);
+    try testing.expectEqual(@as(usize, 0), model.morph_templates[0].clips.len);
+    try testing.expectEqualSlices(f32, &.{0.5}, model.morph_templates[0].defaults);
+    try testing.expectEqual(@as(?u32, 0), model.meshes[0].morph_template);
+}
+
+test "importer: every animation driving one node's weights becomes a clip" {
+    // MorphStressTest carries three of them on one node. Keying the templates by
+    // node and stopping at the first animation kept one and dropped two.
+    var doc = try load(
+        \\ "meshes":[{"primitives":[{"attributes":{"POSITION":0},
+        \\                           "targets":[{"POSITION":3}]}]}],
+        \\ "nodes":[{"mesh":0}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "animations":[{"name":"first","samplers":[{"input":1,"output":1}],
+        \\                "channels":[{"sampler":0,"target":{"node":0,"path":"weights"}}]},
+        \\               {"name":"second","samplers":[{"input":1,"output":1}],
+        \\                "channels":[{"sampler":0,"target":{"node":0,"path":"weights"}}]}]}
+    );
+    defer doc.deinit();
+
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), model.morph_templates.len);
+    const template = model.morph_templates[0];
+    try testing.expectEqual(@as(usize, 2), template.clips.len);
+    try testing.expectEqualStrings("first", template.clips[0].name);
+    try testing.expectEqualStrings("second", template.clips[1].name);
+}
+
+test "importer: two nodes of one morphed mesh blend it independently" {
+    var doc = try load(
+        \\ "meshes":[{"weights":[0.25],
+        \\            "primitives":[{"attributes":{"POSITION":0},
+        \\                           "targets":[{"POSITION":3}]}]}],
+        \\ "nodes":[{"mesh":0},{"mesh":0,"weights":[0.75]}],
+        \\ "scenes":[{"nodes":[0,1]}]}
+    );
+    defer doc.deinit();
+
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    // A morphed primitive is never merged, so the two nodes are two draws.
+    try testing.expectEqual(@as(usize, 2), model.meshes.len);
+    try testing.expectEqual(@as(usize, 2), model.morph_templates.len);
+    try testing.expectEqualSlices(f32, &.{0.25}, model.morph_templates[0].defaults);
+    try testing.expectEqualSlices(f32, &.{0.75}, model.morph_templates[1].defaults);
+
+    var seen: [2]bool = .{ false, false };
+    for (model.meshes) |mesh| seen[mesh.morph_template orelse return error.TestExpectedMorph] = true;
+    try testing.expect(seen[0] and seen[1]);
 }
 
 test "importer: rigid animation anchors the geometry it moves" {
@@ -354,8 +462,12 @@ test "importer: rigid animation anchors the geometry it moves" {
 
     // Node 1 is driven, so it is the anchor and its own transform is not baked:
     // the animator writes it every frame.
+    //
+    // The anchor is slot 0, not node 1. Node 0 is static and earns no slot, so
+    // the two spaces disagree here, which is what makes this the test that
+    // catches an anchor left in the document's node space.
     try testing.expectEqual(@as(usize, 1), model.meshes.len);
-    try testing.expectEqual(@as(?u32, 1), model.meshes[0].anchor);
+    try testing.expectEqual(@as(?resources.Slot, 0), model.meshes[0].anchor);
     try expectVec3(.{ 0, 0, 0 }, model.meshes[0].vertices[0].position);
 
     const animation = model.node_animation orelse return error.TestExpectedAnimation;

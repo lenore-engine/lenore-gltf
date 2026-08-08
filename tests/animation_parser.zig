@@ -293,7 +293,12 @@ test "animation parser: rigid animation slots only the dynamic nodes" {
     );
     defer doc.deinit();
 
-    var template = (try animation_parser.parseNodeAnimation(testing.allocator, &doc)).?;
+    var node_to_slot: [2]?resources.Slot = undefined;
+    var template = (try animation_parser.parseNodeAnimation(
+        testing.allocator,
+        &doc,
+        &node_to_slot,
+    )).?;
     defer template.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), template.slotCount());
@@ -304,6 +309,11 @@ test "animation parser: rigid animation slots only the dynamic nodes" {
 
     // Two channels of one node share its slot, and the list holds it once.
     try testing.expectEqualSlices(u16, &.{0}, template.animated_slots[0]);
+
+    // The map is what an importer resolves a mesh's anchor through, and it is
+    // the only place the node space and the slot space meet. Node 0 is static
+    // and reaches the slot as a prefix, so it earns none of its own.
+    try testing.expectEqualSlices(?resources.Slot, &.{ null, 0 }, &node_to_slot);
 }
 
 test "animation parser: a document with nothing to drive has no rigid animation" {
@@ -313,10 +323,15 @@ test "animation parser: a document with nothing to drive has no rigid animation"
         \\ "scenes":[{"nodes":[0]}]}
     );
     defer static_doc.deinit();
+    // Seeded, because a null result still has to leave the map addressable: a
+    // caller that kept the previous document's slots would move this document's
+    // geometry with them.
+    var node_to_slot: [1]?resources.Slot = .{7};
     try testing.expectEqual(
         @as(?resources.NodeTemplate, null),
-        try animation_parser.parseNodeAnimation(testing.allocator, &static_doc),
+        try animation_parser.parseNodeAnimation(testing.allocator, &static_doc, &node_to_slot),
     );
+    try testing.expectEqual(@as(?resources.Slot, null), node_to_slot[0]);
 
     // One clip whose only channel holds a single key, so it is folded into the
     // node's transform and earns no slot.
@@ -327,10 +342,12 @@ test "animation parser: a document with nothing to drive has no rigid animation"
         \\                "channels":[{"sampler":0,"target":{"node":0,"path":"translation"}}]}]}
     );
     defer held_doc.deinit();
+    node_to_slot = .{7};
     try testing.expectEqual(
         @as(?resources.NodeTemplate, null),
-        try animation_parser.parseNodeAnimation(testing.allocator, &held_doc),
+        try animation_parser.parseNodeAnimation(testing.allocator, &held_doc, &node_to_slot),
     );
+    try testing.expectEqual(@as(?resources.Slot, null), node_to_slot[0]);
 }
 
 test "animation parser: a scene is chosen when the document names none" {
@@ -345,7 +362,12 @@ test "animation parser: a scene is chosen when the document names none" {
     );
     defer doc.deinit();
 
-    var template = (try animation_parser.parseNodeAnimation(testing.allocator, &doc)).?;
+    var node_to_slot: [1]?resources.Slot = undefined;
+    var template = (try animation_parser.parseNodeAnimation(
+        testing.allocator,
+        &doc,
+        &node_to_slot,
+    )).?;
     defer template.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), template.slotCount());
 }
@@ -360,10 +382,14 @@ test "animation parser: every allocation failure is propagated and nothing leaks
     );
     defer doc.deinit();
 
+    // The map is the caller's storage, so it stays off the failing allocator:
+    // the sweep is about what the parser allocates, not about this buffer.
+    var node_to_slot: [2]?resources.Slot = undefined;
+
     var index: usize = 0;
     while (true) : (index += 1) {
         var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = index });
-        if (animation_parser.parseNodeAnimation(failing.allocator(), &doc)) |value| {
+        if (animation_parser.parseNodeAnimation(failing.allocator(), &doc, &node_to_slot)) |value| {
             var template = value.?;
             template.deinit(failing.allocator());
             break;

@@ -2,6 +2,7 @@ const std = @import("std");
 const resources = @import("lenore-resources");
 
 const Allocator = std.mem.Allocator;
+const Slot = resources.Slot;
 const Vertex3D = resources.Vertex3D;
 const VertexStreams = resources.VertexStreams;
 
@@ -17,11 +18,11 @@ pub const Error = error{
 // agree on all three render identically, so concatenating them is lossless and
 // turns a draw call per primitive into a draw call per group.
 //
-// `anchor` is the nearest slotted ancestor the scene walk found, and null is
-// fully static geometry. `material` is null for a primitive that declares none,
+// `anchor` is the animator slot whose world transform moves the geometry, and
+// null is fully static. `material` is null for a primitive that declares none,
 // which section 3.7.2.1 makes the default material rather than material zero.
 pub const GroupKey = struct {
-    anchor: ?u32,
+    anchor: ?Slot,
     material: ?u32,
     skinned: bool,
 };
@@ -71,7 +72,7 @@ pub const Merger = struct {
     pub fn appendPrimitive(
         self: *Merger,
         allocator: Allocator,
-        anchor: ?u32,
+        anchor: ?Slot,
         material: ?u32,
         streams: VertexStreams,
         vertex_count: u32,

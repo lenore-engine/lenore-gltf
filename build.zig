@@ -34,7 +34,6 @@ pub fn build(b: *std.Build) void {
 
     const module_tests = b.addTest(.{ .root_module = mod });
     test_step.dependOn(&b.addRunArtifact(module_tests).step);
-
 }
 
 fn zigFilesIn(b: *std.Build, dir_path: []const u8) [][]const u8 {

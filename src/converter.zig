@@ -8,8 +8,8 @@ const types = @import("types.zig");
 // conversion is not here.
 
 // Section 5.26: both filters are optional, and a client picks its own default
-// when either is absent. Linear is that choice, because it is what an exporter
-// omitting the property means in practice and what every viewer shows.
+// when either is absent. Linear is that choice on both axes, because an exporter
+// that states nothing is not asking for the coarsest sampling available.
 pub fn samplerConfig(sampler: types.Sampler) resources.SamplerConfig {
     return .{
         .mag_filter = magFilter(sampler.mag_filter),
@@ -30,26 +30,27 @@ pub fn magFilter(filter: ?types.MagFilter) resources.Filter {
     };
 }
 
+// The value both halves below fall back to when `minFilter` is absent. It is
+// spelled as the trilinear filter and not as LINEAR, because those two are no
+// longer the same request: LINEAR names the original image alone, and defaulting
+// to it would switch mipmapping off for every asset that omits the property.
+const absent_min_filter: types.MinFilter = .linear_mipmap_linear;
+
 // The minification filter carries two decisions in one value: how to sample
 // within a level, and how to move between levels. This is the first.
 pub fn minFilter(filter: ?types.MinFilter) resources.Filter {
-    return switch (filter orelse .linear) {
+    return switch (filter orelse absent_min_filter) {
         .nearest, .nearest_mipmap_nearest, .nearest_mipmap_linear => .nearest,
         .linear, .linear_mipmap_nearest, .linear_mipmap_linear => .linear,
     };
 }
 
-// And this is the second.
-//
-// NEAREST and LINEAR name no mipmap behaviour because they ask for no
-// mipmapping at all, which SamplerConfig cannot express: turning mipmaps off is
-// a level-of-detail clamp rather than a mode, and the type carries no clamp.
-// They map to linear, so an asset asking for none gets blending between levels
-// wherever the engine generated them. Visible on pixel art at distance and
-// nowhere else, and the place to fix it is SamplerConfig.
+// And this is the second. NEAREST and LINEAR name no mipmap behaviour because
+// they ask for none: specification 3.8.4.2 has them sampling the original image
+// where the other four select a pre-minified one.
 pub fn mipmapMode(filter: ?types.MinFilter) resources.MipmapMode {
-    return switch (filter orelse .linear) {
-        .nearest, .linear => .linear,
+    return switch (filter orelse absent_min_filter) {
+        .nearest, .linear => .none,
         .nearest_mipmap_nearest, .linear_mipmap_nearest => .nearest,
         .nearest_mipmap_linear, .linear_mipmap_linear => .linear,
     };

@@ -136,7 +136,13 @@ pub const Model = struct {
     images: []Image,
     lights: []Light,
     skins: []Skin,
-    node_animation: ?resources.NodeTemplate,
+    // Boxed rather than held inline, because an animator borrows the template by
+    // address and holds it for as long as it runs. Inline, that address is part
+    // of the model, so returning or assigning a model would leave every animator
+    // built from it pointing at the old storage. The rest of what a template
+    // consumer borrows already lives behind a slice, which is why this was the
+    // only field that made a model unmovable.
+    node_animation: ?*resources.NodeTemplate,
     // One per node that instantiates a mesh with morph targets. Per node and not
     // per mesh: section 3.7.4 makes the weights a property of the instantiation,
     // so two nodes sharing one mesh blend it independently.
@@ -152,7 +158,10 @@ pub const Model = struct {
         allocator.free(self.lights);
         for (self.skins) |*skin| skin.deinit(allocator);
         allocator.free(self.skins);
-        if (self.node_animation) |*animation| animation.deinit(allocator);
+        if (self.node_animation) |animation| {
+            animation.deinit(allocator);
+            allocator.destroy(animation);
+        }
         for (self.morph_templates) |*template| template.deinit(allocator);
         allocator.free(self.morph_templates);
         self.* = undefined;
@@ -194,10 +203,46 @@ pub fn build(
     const node_to_morph = try allocator.alloc(?u32, doc.nodes.len);
     defer allocator.free(node_to_morph);
 
-    model.node_animation = try animation_parser.parseNodeAnimation(allocator, doc, node_to_slot);
+    if (try animation_parser.parseNodeAnimation(allocator, doc, node_to_slot)) |parsed| {
+        var template = parsed;
+        // Discharged once the box holds it. Until then the parse owns every
+        // allocation the template made and nothing else would free them.
+        errdefer template.deinit(allocator);
+        const boxed = try allocator.create(resources.NodeTemplate);
+        boxed.* = template;
+        model.node_animation = boxed;
+    }
     model.morph_templates = try buildMorphTemplates(allocator, doc, node_to_morph);
     try buildGeometry(allocator, doc, &model, node_to_slot, node_to_morph);
     return model;
+}
+
+// Read the images `build` named and did not open, filling `bytes` for every one
+// that lives in a file. The document's own root and the directory it was opened
+// against are what a key is relative to, so this takes the same `root`
+// `loader.open` was given.
+//
+// Separate from `build` and optional, which is the whole point: an artifact
+// cache holding a converted form of an image never needs the original, and
+// `build` stays free of the filesystem and testable on documents assembled in
+// memory. This is the one function in this file that is neither.
+//
+// Images already carrying bytes are left alone. Those came from a data URI or a
+// buffer view and there is no file behind them.
+//
+// A read that fails leaves the images before it attached. They belong to the
+// model either way, so the caller's `deinit` frees them, and a partial read is
+// visible as an image that still has none.
+pub fn readExternalImages(
+    allocator: Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    model: *Model,
+) loader.Error!void {
+    for (model.images) |*image| {
+        if (image.bytes != null) continue;
+        image.bytes = try loader.readBeneath(allocator, io, root, image.key);
+    }
 }
 
 // One entry per image the document declares, in its own index space, so a

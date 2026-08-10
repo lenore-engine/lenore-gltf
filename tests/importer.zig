@@ -292,6 +292,74 @@ test "importer: an image is named, and only an embedded one is read" {
     try testing.expectEqual([3]f32{ 3, 3, 3 }, model.materials[0].factors.emissive);
 }
 
+// The second half of the split above. `build` names a file and leaves it, and
+// this is what a consumer calls when it wants the bytes rather than the name.
+const file_backed_images = one_triangle ++
+    \\ "images":[{"uri":"textures/skin%20a.png"},
+    \\           {"bufferView":6,"mimeType":"image/png"},
+    \\           {"uri":"missing.png"}],
+    \\ "textures":[{"source":0},{"source":1},{"source":2}],
+    \\ "materials":[{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}},
+    \\               "normalTexture":{"index":1},
+    \\               "emissiveTexture":{"index":2}}],
+    \\ "nodes":[{"mesh":0}],
+    \\ "scenes":[{"nodes":[0]}]}
+;
+
+const png_on_disk = [_]u8{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'o', 'n', 'd', 'i', 's', 'k' };
+
+fn writeUnder(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
+    try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = data });
+}
+
+test "importer: reading the external images fills the ones build only named" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeUnder(tmp.dir, "models/character/textures/skin a.png", &png_on_disk);
+    try writeUnder(tmp.dir, "models/character/missing.png", &png_on_disk);
+
+    var doc = try load(file_backed_images);
+    defer doc.deinit();
+    var model = try importer.build(testing.allocator, &doc, "models/character");
+    defer model.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(?[]const u8, null), model.images[0].bytes);
+    try importer.readExternalImages(testing.allocator, std.testing.io, tmp.dir, &model);
+
+    // The file's own bytes, and the percent-encoded space in the reference has
+    // to have been decoded for the read to find it at all.
+    try testing.expectEqualSlices(u8, &png_on_disk, model.images[0].bytes.?);
+
+    // The embedded one is untouched. Reading over it would replace bytes that
+    // came out of a buffer view with a file that does not exist.
+    try testing.expectEqualSlices(u8, &image_bytes, model.images[1].bytes.?);
+}
+
+test "importer: a missing image file is an error and leaves the model readable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The first image's file exists and the third's does not, so the read gets
+    // one image in before it fails.
+    try writeUnder(tmp.dir, "models/character/textures/skin a.png", &png_on_disk);
+
+    var doc = try load(file_backed_images);
+    defer doc.deinit();
+    var model = try importer.build(testing.allocator, &doc, "models/character");
+    defer model.deinit(testing.allocator);
+
+    try testing.expectError(
+        error.FileNotFound,
+        importer.readExternalImages(testing.allocator, std.testing.io, tmp.dir, &model),
+    );
+
+    // What the model looks like afterwards, which is what the caller's `deinit`
+    // has to cope with: everything read before the failure belongs to the model
+    // and the rest still has no bytes.
+    try testing.expectEqualSlices(u8, &png_on_disk, model.images[0].bytes.?);
+    try testing.expectEqual(@as(?[]const u8, null), model.images[2].bytes);
+}
+
 test "importer: a light carries the transform of the node that references it" {
     var doc = try load(one_triangle ++
         \\ "extensionsUsed":["KHR_lights_punctual"],

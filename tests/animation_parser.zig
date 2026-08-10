@@ -22,7 +22,7 @@ fn floats(comptime values: []const f32) [values.len * 4]u8 {
 //
 //   0 two_times    1 one_time      2 two_vec3     3 two_vec4
 //   4 spline_vec3  5 two_matrices  6 four_scalars 7 one_vec3
-//   8 six_scalars
+//   8 six_scalars  9 spline_vec4
 const two_times = floats(&.{ 0.0, 1.0 });
 const one_time = floats(&.{0.0});
 const two_vec3 = floats(&.{ 1.0, 0.0, 0.0, 2.0, 0.0, 0.0 });
@@ -37,13 +37,21 @@ const four_scalars = floats(&.{ 0.1, 0.2, 0.3, 0.4 });
 const one_vec3 = floats(&.{ 0.0, 0.0, 0.0 });
 // One cubic spline key of two morph weights: in-tangent, value, out-tangent.
 const six_scalars = floats(&.{ 9.0, 9.0, 0.5, 0.6, 8.0, 8.0 });
+// One cubic spline rotation key, the same way. All four components of a
+// quaternion tangent are real, so none of these is a placeholder.
+const spline_vec4 = floats(&.{
+    1.0, 2.0, 3.0, 4.0,
+    0.0, 0.0, 0.0, 1.0,
+    5.0, 6.0, 7.0, 8.0,
+});
 
 const samples = two_times ++ one_time ++ two_vec3 ++ two_vec4 ++
-    spline_vec3 ++ two_matrices ++ four_scalars ++ one_vec3 ++ six_scalars;
+    spline_vec3 ++ two_matrices ++ four_scalars ++ one_vec3 ++ six_scalars ++
+    spline_vec4;
 
 const prelude =
     \\{"asset":{"version":"2.0"},
-    \\ "buffers":[{"byteLength":284,"uri":"a.bin"}],
+    \\ "buffers":[{"byteLength":332,"uri":"a.bin"}],
     \\ "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":8},
     \\                {"buffer":0,"byteOffset":8,"byteLength":4},
     \\                {"buffer":0,"byteOffset":12,"byteLength":24},
@@ -52,7 +60,8 @@ const prelude =
     \\                {"buffer":0,"byteOffset":104,"byteLength":128},
     \\                {"buffer":0,"byteOffset":232,"byteLength":16},
     \\                {"buffer":0,"byteOffset":248,"byteLength":12},
-    \\                {"buffer":0,"byteOffset":260,"byteLength":24}],
+    \\                {"buffer":0,"byteOffset":260,"byteLength":24},
+    \\                {"buffer":0,"byteOffset":284,"byteLength":48}],
     \\ "accessors":[{"bufferView":0,"componentType":5126,"count":2,"type":"SCALAR"},
     \\              {"bufferView":1,"componentType":5126,"count":1,"type":"SCALAR"},
     \\              {"bufferView":2,"componentType":5126,"count":2,"type":"VEC3"},
@@ -61,7 +70,8 @@ const prelude =
     \\              {"bufferView":5,"componentType":5126,"count":2,"type":"MAT4"},
     \\              {"bufferView":6,"componentType":5126,"count":4,"type":"SCALAR"},
     \\              {"bufferView":7,"componentType":5126,"count":1,"type":"VEC3"},
-    \\              {"bufferView":8,"componentType":5126,"count":6,"type":"SCALAR"}],
+    \\              {"bufferView":8,"componentType":5126,"count":6,"type":"SCALAR"},
+    \\              {"bufferView":9,"componentType":5126,"count":3,"type":"VEC4"}],
 ;
 
 fn load(comptime body: []const u8) !document.Document {
@@ -188,14 +198,18 @@ test "animation parser: a clip is rebased onto slots and unmapped channels drop"
 
     // The track's tag is the path, and it carries that path's keys and no other.
     const translation = clip.channels[0].track.translation;
-    try testing.expectEqual(@as(usize, 2), translation.len);
-    try expectVec(.{ 1, 0, 0, 1 }, translation[0].value);
-    try expectVec(.{ 2, 0, 0, 1 }, translation[1].value);
-    try testing.expectEqual(@as(f32, 1.0), translation[1].time);
-    try expectVec(.{ 0, 0, 0, 1 }, clip.channels[1].track.rotation[0].value);
+    try testing.expectEqual(@as(usize, 2), translation.keys.len);
+    try expectVec(.{ 1, 0, 0, 1 }, translation.keys[0].value);
+    try expectVec(.{ 2, 0, 0, 1 }, translation.keys[1].value);
+    try testing.expectEqual(@as(f32, 1.0), translation.keys[1].time);
+    try expectVec(.{ 0, 0, 0, 1 }, clip.channels[1].track.rotation.keys[0].value);
+
+    // A sampler that declared no interpolation is LINEAR, and a linear track
+    // carries no tangents to be read.
+    try testing.expectEqual(resources.Interpolation.linear, translation.blend);
 }
 
-test "animation parser: a cubic spline track keeps the value and drops the tangents" {
+test "animation parser: a cubic spline track keeps the value and both tangents" {
     var doc = try load(
         \\ "nodes":[{}],
         \\ "scenes":[{"nodes":[0]}],
@@ -210,10 +224,18 @@ test "animation parser: a cubic spline track keeps the value and drops the tange
 
     // The output holds in-tangent, value, out-tangent per key. Taking element
     // zero would give (9, 9, 9).
-    const keys = clip.channels[0].track.translation;
-    try testing.expectEqual(@as(usize, 1), keys.len);
-    try expectVec(.{ 4, 5, 6, 1 }, keys[0].value);
-    try testing.expectEqual(resources.Interpolation.cubicspline, clip.channels[0].interpolation);
+    const track = clip.channels[0].track.translation;
+    try testing.expectEqual(@as(usize, 1), track.keys.len);
+    try expectVec(.{ 4, 5, 6, 1 }, track.keys[0].value);
+
+    // The tangents are the elements either side of it, and they are read into
+    // the mode rather than beside it: a track sampled as a spline cannot be
+    // missing them. Their w is zero because they are derivatives and not points.
+    const tangents = track.blend.cubicspline;
+    try testing.expectEqual(@as(usize, 1), tangents.len);
+    try expectVec(.{ 9, 9, 9, 0 }, tangents[0].in);
+    try expectVec(.{ 8, 8, 8, 0 }, tangents[0].out);
+    try testing.expectEqual(resources.Interpolation.cubicspline, clip.channels[0].track.interpolation());
 }
 
 const morph_document =
@@ -240,7 +262,7 @@ test "animation parser: morph weights come back one vector per key" {
     try testing.expectEqualSlices(f32, &.{ 0.1, 0.2, 0.3, 0.4 }, track.values);
 }
 
-test "animation parser: a cubic spline weight key keeps the value, not the tangent" {
+test "animation parser: a cubic spline weight key keeps the value and both tangents" {
     var doc = try load(
         \\ "nodes":[{"mesh":0}],
         \\ "scenes":[{"nodes":[0]}],
@@ -254,12 +276,21 @@ test "animation parser: a cubic spline weight key keeps the value, not the tange
     var parsed = (try animation_parser.parseMorphWeights(testing.allocator, &doc, 0, 0)).?;
     defer parsed.animation.deinit(testing.allocator);
 
-    // One key of two targets, the tangents either side of it dropped. Taking the
-    // first element of the three would give (9, 9).
+    // One key of two targets. The file interleaves in-tangent, value and
+    // out-tangent per key, so taking the first run of the three would give
+    // (9, 9) for the values.
     const track = parsed.animation.channels[0].track.weights;
     try testing.expectEqual(@as(u32, 2), track.width);
     try testing.expectEqualSlices(f32, &.{0.0}, track.times);
     try testing.expectEqualSlices(f32, &.{ 0.5, 0.6 }, track.values);
+
+    // The tangents are compacted into their own array, in-run then out-run per
+    // key, which is the layout the sampler indexes them by.
+    try testing.expectEqualSlices(
+        f32,
+        &.{ 9.0, 9.0, 8.0, 8.0 },
+        track.blend.cubicspline,
+    );
 }
 
 test "animation parser: a weights channel for another node is not this node's" {
@@ -407,4 +438,28 @@ test "animation parser: every allocation failure is propagated and nothing leaks
         } else |err| try testing.expectEqual(error.OutOfMemory, err);
     }
     try testing.expect(index > 0);
+}
+
+test "animation parser: a rotation spline keeps all four components of its tangents" {
+    var doc = try load(
+        \\ "nodes":[{}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "animations":[{"samplers":[{"input":1,"output":9,"interpolation":"CUBICSPLINE"}],
+        \\                "channels":[{"sampler":0,"target":{"node":0,"path":"rotation"}}]}]}
+    );
+    defer doc.deinit();
+
+    const node_to_slot = [_]?resources.Slot{0};
+    var clip = try animation_parser.parseClip(testing.allocator, &doc, 0, &node_to_slot);
+    defer clip.deinit(testing.allocator);
+
+    const track = clip.channels[0].track.rotation;
+    try expectVec(.{ 0, 0, 0, 1 }, track.keys[0].value);
+
+    // A quaternion tangent is a derivative in quaternion space and every
+    // component of it is real, unlike the vector tangents whose w is zero
+    // because they belong to points that carry one.
+    const tangents = track.blend.cubicspline;
+    try expectVec(.{ 1, 2, 3, 4 }, tangents[0].in);
+    try expectVec(.{ 5, 6, 7, 8 }, tangents[0].out);
 }

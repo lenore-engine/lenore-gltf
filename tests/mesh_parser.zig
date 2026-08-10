@@ -279,7 +279,48 @@ test "mesh parser: a missing tangent basis is generated from the UV gradient" {
         try expectVec4(.{ 0, 1, 0, -1 }, vertex.tangent);
 }
 
-test "mesh parser: a declared tangent is kept as it stands" {
+// A supplied tangent pointing along its own normal. The projection that makes
+// the basis orthogonal takes it to exactly zero, which has no direction left in
+// it, so the substitute is used and the file's handedness is kept. The Khronos
+// Sponza carries vertices shaped exactly like this; copied through, the shader
+// normalizes that zero into a NaN and the frame carries it.
+test "mesh parser: a supplied tangent parallel to its normal is replaced" {
+    const positions = floats(&.{ 0, 0, 0, 1, 0, 0, 0, 1, 0 });
+    const normals = floats(&.{ 0, 0, 1, 0, 0, 1, 0, 0, 1 });
+    const uvs = floats(&.{ 0, 0, 0, 1, 1, 0 });
+    const tangents = floats(&.{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1 });
+
+    var doc = try load(
+        \\{"asset":{"version":"2.0"},
+        \\ "buffers":[{"byteLength":144,"uri":"b.bin"}],
+        \\ "bufferViews":[{"buffer":0,"byteLength":36},
+        \\                {"buffer":0,"byteOffset":36,"byteLength":36},
+        \\                {"buffer":0,"byteOffset":72,"byteLength":24},
+        \\                {"buffer":0,"byteOffset":96,"byteLength":48}],
+        \\ "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},
+        \\              {"bufferView":1,"componentType":5126,"count":3,"type":"VEC3"},
+        \\              {"bufferView":2,"componentType":5126,"count":3,"type":"VEC2"},
+        \\              {"bufferView":3,"componentType":5126,"count":3,"type":"VEC4"}],
+        \\ "meshes":[{"primitives":[{"attributes":
+        \\   {"POSITION":0,"NORMAL":1,"TEXCOORD_0":2,"TANGENT":3}}]}]}
+    , &(positions ++ normals ++ uvs ++ tangents));
+    defer doc.deinit();
+
+    var primitive = try mesh_parser.parsePrimitive(testing.allocator, &doc, doc.meshes[0].primitives[0]);
+    defer primitive.deinit(testing.allocator);
+
+    for (primitive.vertices) |vertex| {
+        try expectVec4(.{ 1, 0, 0, 1 }, vertex.tangent);
+        // The property the picture depends on, stated rather than implied by
+        // the value above: finite, unit length, and orthogonal to the normal.
+        const t: @Vector(3, f32) = .{ vertex.tangent[0], vertex.tangent[1], vertex.tangent[2] };
+        try testing.expect(std.math.isFinite(t[0]) and std.math.isFinite(t[1]) and std.math.isFinite(t[2]));
+        try testing.expectApproxEqAbs(1.0, @sqrt(@reduce(.Add, t * t)), 1e-6);
+        try testing.expectApproxEqAbs(0.0, @reduce(.Add, t * vertex.normal), 1e-6);
+    }
+}
+
+test "mesh parser: a usable declared tangent is kept as it stands" {
     const positions = floats(&.{ 0, 0, 0, 1, 0, 0, 0, 1, 0 });
     const normals = floats(&.{ 0, 0, 1, 0, 0, 1, 0, 0, 1 });
     const uvs = floats(&.{ 0, 0, 0, 1, 1, 0 });

@@ -203,7 +203,11 @@ fn refusal(io: std.Io, directory: std.Io.Dir, name: []const u8, err: anytype) Er
     return err;
 }
 
-fn readBeneath(
+// Public because resolving a reference and reading it are one job split over
+// two calls, and `resolveConfined` is the other half. A consumer holding a key
+// this module produced reads it through here rather than reimplementing the
+// containment below.
+pub fn readBeneath(
     allocator: Allocator,
     io: std.Io,
     root: std.Io.Dir,

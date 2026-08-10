@@ -19,6 +19,7 @@ const NodeTemplate = resources.NodeTemplate;
 const SkeletonTemplate = resources.SkeletonTemplate;
 
 pub const Error = document.Error ||
+    resources.AnimationInitError ||
     SkeletonTemplate.InitError ||
     NodeTemplate.InitError;
 
@@ -304,7 +305,6 @@ pub fn parseClip(
         channels.appendAssumeCapacity(.{
             .track = try readTrack(allocator, doc, sampler, channel.target_path),
             .target_slot = slot,
-            .interpolation = interpolationOf(sampler.interpolation),
         });
     }
 
@@ -316,22 +316,9 @@ pub fn parseClip(
     return try Animation.init(allocator, owned, source.name orelse "animation");
 }
 
-// The document's enum and the resource one carry the same three modes and stay
-// separate types on purpose: one is what the file declared, the other is what
-// playback implements. The switch is exhaustive, so adding a mode to either side
-// stops the build here rather than silently mapping to the wrong one.
-fn interpolationOf(mode: types.Interpolation) resources.Interpolation {
-    return switch (mode) {
-        .linear => .linear,
-        .step => .step,
-        .cubicspline => .cubicspline,
-    };
-}
-
-// A cubic spline sampler stores an in-tangent, the value and an out-tangent per
-// key. The tangents are dropped and the track is sampled linearly, which
-// resources.Interpolation documents as the deliberate approximation: refusing
-// the mode instead would refuse a large share of real assets.
+// glTF 2.0, animation.sampler.output: a CUBICSPLINE sampler stores three values
+// per key, in the order in-tangent, property value, out-tangent, so a key's
+// value is at index 3k + 1 and its tangents either side of it.
 //
 // validate.zig has already required the output count to be the input count times
 // the width times three for a cubic spline and times one otherwise, so the key
@@ -343,8 +330,9 @@ fn readTrack(
     path: types.TargetPath,
 ) Error!Track {
     const key_count = doc.accessors[sampler.input].count;
-    const stride: usize = if (sampler.interpolation == .cubicspline) 3 else 1;
-    const value: usize = if (sampler.interpolation == .cubicspline) 1 else 0;
+    const spline = sampler.interpolation == .cubicspline;
+    const stride: usize = if (spline) 3 else 1;
+    const value: usize = if (spline) 1 else 0;
 
     const times = try allocator.alloc(f32, key_count);
     defer allocator.free(times);
@@ -357,11 +345,25 @@ fn readTrack(
             try doc.read([3]f32, sampler.output, values);
 
             const keys = try allocator.alloc(Keyframe(zm.Vec), key_count);
+            errdefer allocator.free(keys);
             for (keys, times, 0..) |*key, time, index| {
                 const triple = values[index * stride + value];
                 key.* = .{ .time = time, .value = zm.f32x4(triple[0], triple[1], triple[2], 1.0) };
             }
-            return if (path == .translation) .{ .translation = keys } else .{ .scale = keys };
+
+            // Exhaustive, so a mode added to either the document's enum or the
+            // resource one stops the build here rather than mapping to the
+            // wrong arm.
+            const blend: resources.Blend(zm.Vec) = switch (sampler.interpolation) {
+                .linear => .linear,
+                .step => .step,
+                .cubicspline => .{
+                    .cubicspline = try readVectorTangents(allocator, key_count, values),
+                },
+            };
+
+            const track: resources.TransformTrack(zm.Vec) = .{ .keys = keys, .blend = blend };
+            return if (path == .translation) .{ .translation = track } else .{ .scale = track };
         },
         .rotation => {
             const values = try allocator.alloc([4]f32, doc.accessors[sampler.output].count);
@@ -369,6 +371,7 @@ fn readTrack(
             try doc.read([4]f32, sampler.output, values);
 
             const keys = try allocator.alloc(Keyframe(zm.Quat), key_count);
+            errdefer allocator.free(keys);
             for (keys, times, 0..) |*key, time, index| {
                 const quaternion = values[index * stride + value];
                 key.* = .{
@@ -376,11 +379,60 @@ fn readTrack(
                     .value = zm.f32x4(quaternion[0], quaternion[1], quaternion[2], quaternion[3]),
                 };
             }
-            return .{ .rotation = keys };
+
+            const blend: resources.Blend(zm.Quat) = switch (sampler.interpolation) {
+                .linear => .linear,
+                .step => .step,
+                .cubicspline => .{
+                    .cubicspline = try readQuatTangents(allocator, key_count, values),
+                },
+            };
+
+            return .{ .rotation = .{ .keys = keys, .blend = blend } };
         },
         // Handled by parseMorphWeights, and skipped by every caller here.
         .weights => return error.TypeMismatch,
     }
+}
+
+// The in-tangent and out-tangent either side of key k's value, with a w of zero.
+// They are derivatives rather than points, and section C.5's two value weights
+// sum to one, so a zero here is what leaves the w the keys were built with.
+fn readVectorTangents(
+    allocator: Allocator,
+    key_count: usize,
+    values: []const [3]f32,
+) Error![]resources.Tangents(zm.Vec) {
+    const tangents = try allocator.alloc(resources.Tangents(zm.Vec), key_count);
+    for (tangents, 0..) |*tangent, index| {
+        const in = values[index * 3];
+        const out = values[index * 3 + 2];
+        tangent.* = .{
+            .in = zm.f32x4(in[0], in[1], in[2], 0.0),
+            .out = zm.f32x4(out[0], out[1], out[2], 0.0),
+        };
+    }
+    return tangents;
+}
+
+// All four components are real for a rotation: the tangent is a derivative in
+// quaternion space and section C.5 normalizes the result rather than the
+// tangents.
+fn readQuatTangents(
+    allocator: Allocator,
+    key_count: usize,
+    values: []const [4]f32,
+) Error![]resources.Tangents(zm.Quat) {
+    const tangents = try allocator.alloc(resources.Tangents(zm.Quat), key_count);
+    for (tangents, 0..) |*tangent, index| {
+        const in = values[index * 3];
+        const out = values[index * 3 + 2];
+        tangent.* = .{
+            .in = zm.f32x4(in[0], in[1], in[2], in[3]),
+            .out = zm.f32x4(out[0], out[1], out[2], out[3]),
+        };
+    }
+    return tangents;
 }
 
 // A parsed morph weight clip and the number of targets one key carries, so a
@@ -422,8 +474,9 @@ pub fn parseMorphWeights(
         defer allocator.free(raw);
         try doc.read(f32, sampler.output, raw);
 
-        // Compacted to one weight vector per key, dropping the cubic spline
-        // tangents, which sit either side of the value.
+        // The values compacted to one run of weights per key. A spline sampler
+        // interleaves in-tangent, value and out-tangent per key, so the values
+        // are one run in three and the tangents are the other two.
         const values = try allocator.alloc(f32, key_count * width);
         errdefer allocator.free(values);
         const offset = if (sampler.interpolation == .cubicspline) width else 0;
@@ -431,12 +484,40 @@ pub fn parseMorphWeights(
             @memcpy(values[key * width ..][0..width], raw[key * stride * width + offset ..][0..width]);
         }
 
+        // The two tangent runs of each key, kept adjacent in that order, which
+        // is the layout WeightBlend.cubicspline documents.
+        const blend: resources.WeightBlend = switch (sampler.interpolation) {
+            .linear => .linear,
+            .step => .step,
+            .cubicspline => blk: {
+                const tangents = try allocator.alloc(f32, key_count * width * 2);
+                errdefer allocator.free(tangents);
+                for (0..key_count) |key| {
+                    const key_base = key * 3 * width;
+                    @memcpy(tangents[2 * key * width ..][0..width], raw[key_base..][0..width]);
+                    @memcpy(
+                        tangents[(2 * key + 1) * width ..][0..width],
+                        raw[key_base + 2 * width ..][0..width],
+                    );
+                }
+                break :blk .{ .cubicspline = tangents };
+            },
+        };
+        errdefer switch (blend) {
+            .cubicspline => |tangents| allocator.free(tangents),
+            .linear, .step => {},
+        };
+
         var channels = try allocator.alloc(Channel, 1);
         errdefer allocator.free(channels);
         channels[0] = .{
-            .track = .{ .weights = .{ .times = times, .values = values, .width = @intCast(width) } },
+            .track = .{ .weights = .{
+                .times = times,
+                .values = values,
+                .width = @intCast(width),
+                .blend = blend,
+            } },
             .target_slot = 0,
-            .interpolation = interpolationOf(sampler.interpolation),
         };
 
         return .{

@@ -118,7 +118,14 @@ pub fn parsePrimitive(
     if (primitive.tangent) |accessor| {
         const tangents = try readVectors(4, allocator, doc, accessor);
         defer allocator.free(tangents);
-        for (result.vertices, tangents) |*vertex, tangent| vertex.tangent = tangent;
+        // Repaired on the way in, not trusted. A supplied tangent is asset data
+        // and the document is not required to have kept it usable; the
+        // handedness is the file's either way, because only the direction can
+        // be reconstructed here.
+        for (result.vertices, tangents) |*vertex, tangent| {
+            const fixed = orthonormalTangent(vertex.normal, .{ tangent[0], tangent[1], tangent[2] });
+            vertex.tangent = .{ fixed[0], fixed[1], fixed[2], tangent[3] };
+        }
     }
 
     if (primitive.texcoord_0) |accessor| {
@@ -447,15 +454,25 @@ fn generateTangents(allocator: Allocator, vertices: []Vertex3D, indices: []const
 
     for (vertices, tangents, bitangents) |*vertex, accumulated, bitangent| {
         const normal = vertex.normal;
-        // Gram-Schmidt against the normal, so the basis stays orthogonal where
-        // the accumulated tangent leans out of the surface.
-        const projected = accumulated - normal * @as(Vec3, @splat(dot(normal, accumulated)));
-        const length = @sqrt(dot(projected, projected));
-        const tangent = if (length > 1e-8)
-            projected / @as(Vec3, @splat(length))
-        else
-            orthogonalTo(normal);
+        const tangent = orthonormalTangent(normal, accumulated);
         const handedness: f32 = if (dot(cross(normal, tangent), bitangent) < 0.0) -1.0 else 1.0;
         vertex.tangent = .{ tangent[0], tangent[1], tangent[2], handedness };
     }
+}
+
+// A tangent the fragment stage can use: orthogonal to the normal and unit
+// length. Gram-Schmidt against the normal keeps the basis orthogonal where the
+// tangent leans out of the surface, and a tangent parallel to its normal
+// projects to exactly zero, which has no direction to recover.
+//
+// Not hypothetical, and not only a property of tangents this file generates.
+// The Khronos Sponza supplies tangents that are exactly parallel to their
+// vertex normal. Normalizing that zero in the shader yields a NaN, which no
+// facing test rejects because every comparison against a NaN is false, and one
+// such fragment spreads through a bloom chain until it is a black rectangle.
+fn orthonormalTangent(normal: Vec3, raw: Vec3) Vec3 {
+    const projected = raw - normal * @as(Vec3, @splat(dot(normal, raw)));
+    const length = @sqrt(dot(projected, projected));
+    if (length > 1e-8) return projected / @as(Vec3, @splat(length));
+    return orthogonalTo(normal);
 }

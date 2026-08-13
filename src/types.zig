@@ -117,6 +117,10 @@ pub const Node = struct {
     scale: ?[3]f32,
     matrix: ?[16]f32,
     weights: []const f32,
+    // This node's own KHR_node_visibility flag, not the inherited one. A scene
+    // walk carries the inherited value, because a false here hides the whole
+    // subtree below it.
+    visible: bool,
 };
 
 pub const PerspectiveCamera = struct {
@@ -203,6 +207,11 @@ pub const Material = struct {
     alpha_mode: AlphaMode,
     alpha_cutoff: f32,
     double_sided: bool,
+    // KHR_materials_unlit. The extension carries no value of its own, so the
+    // document's flag is its presence and the fields above stay as the file
+    // gave them: the extension calls them a fallback for clients without it,
+    // and stripping them here would decide for a consumer that may want them.
+    unlit: bool,
 };
 
 pub const Texture = struct {

@@ -115,7 +115,11 @@ pub fn parsePrimitive(
         for (result.vertices, normals) |*vertex, normal| vertex.normal = normal;
     }
 
-    if (primitive.tangent) |accessor| {
+    // Section 3.7.2.1: when normals are not specified the provided tangents
+    // MUST be ignored. Not read and then overwritten: a tangent is only
+    // meaningful against the normal it was authored with, and the flat normals
+    // computed below are not that normal.
+    if (primitive.tangent) |accessor| if (primitive.normal != null) {
         const tangents = try readVectors(4, allocator, doc, accessor);
         defer allocator.free(tangents);
         // Repaired on the way in, not trusted. A supplied tangent is asset data
@@ -126,7 +130,7 @@ pub fn parsePrimitive(
             const fixed = orthonormalTangent(vertex.normal, .{ tangent[0], tangent[1], tangent[2] });
             vertex.tangent = .{ fixed[0], fixed[1], fixed[2], tangent[3] };
         }
-    }
+    };
 
     if (primitive.texcoord_0) |accessor| {
         const uvs = try readVectors(2, allocator, doc, accessor);
@@ -149,11 +153,22 @@ pub fn parsePrimitive(
 
     result.indices = try readIndices(allocator, doc, primitive.indices, vertex_count);
 
+    // The flat normals section 3.7.2.1 requires, and the expansion they need.
+    // Before the tangent generation below, which reads the normals it builds a
+    // basis against.
+    if (primitive.normal == null) try flatten(allocator, &result);
+
     // A tangent basis for a primitive that can sample a normal map and ships
     // none. Without it those vertices keep the constant (1, 0, 0, 1) above, and
     // a tangent space normal map reads as noise because the basis is not
     // aligned to the UV gradient.
-    if (primitive.tangent == null and primitive.normal != null and primitive.texcoord_0 != null)
+    // A supplied tangent is usable only against the normal it was authored
+    // with, so a primitive that declared no normals has none whatever it
+    // declared: those tangents were ignored above and the flat normals replaced
+    // the basis they belonged to. Both cases generate here, and both need a UV
+    // gradient to generate from.
+    if (primitive.texcoord_0 != null and
+        (primitive.tangent == null or primitive.normal == null))
         try generateTangents(allocator, result.vertices, result.indices);
 
     return result;
@@ -409,6 +424,125 @@ fn normalize(v: Vec3) Vec3 {
     const length = @sqrt(dot(v, v));
     if (length <= 1e-8) return .{ 1.0, 0.0, 0.0 };
     return v / @as(Vec3, @splat(length));
+}
+
+// One vertex per corner, each carrying the normal of the face it belongs to.
+//
+// Section 3.7.2.1 requires flat normals where a primitive declares none, and a
+// flat normal belongs to the face rather than to the vertex: a corner shared by
+// two faces has no single value to carry. Splitting only the corners whose
+// faces disagree would need a map keyed on the pair and would split almost all
+// of them anyway, because two faces of an unsmoothed mesh disagree unless they
+// are coplanar. So the geometry is expanded whole and the index list becomes
+// the identity, which everything downstream still reads through.
+//
+// The cost is paid by the assets that need it and by nothing else: a primitive
+// declaring normals never reaches here.
+fn flatten(allocator: Allocator, primitive: *Primitive) Error!void {
+    const corners = primitive.indices.len;
+
+    const vertices = try allocator.alloc(Vertex3D, corners);
+    errdefer allocator.free(vertices);
+    for (vertices, primitive.indices) |*corner, index| corner.* = primitive.vertices[index];
+
+    // The deltas of one vertex are a contiguous run of `target_count` vectors,
+    // so a corner takes the run of the vertex it came from.
+    var morph: ?MorphDeltas = null;
+    errdefer if (morph) |*owned| owned.deinit(allocator);
+    if (primitive.morph) |source| {
+        const targets = source.target_count;
+        var expanded: MorphDeltas = .{
+            .positions = try allocator.alloc(f32, corners * targets * 3),
+            .normals = &.{},
+            .target_count = targets,
+        };
+        morph = expanded;
+        // Every target gets a flat normal below whether or not the file
+        // supplied one, so the array exists even where the source had none.
+        expanded.normals = try allocator.alloc(f32, corners * targets * 3);
+        morph = expanded;
+        @memset(expanded.normals, 0.0);
+
+        const run = @as(usize, targets) * 3;
+        for (primitive.indices, 0..) |index, corner| {
+            const from = index * run;
+            @memcpy(
+                expanded.positions[corner * run ..][0..run],
+                source.positions[from..][0..run],
+            );
+        }
+    }
+
+    allocator.free(primitive.vertices);
+    primitive.vertices = vertices;
+    if (primitive.morph) |*owned| owned.deinit(allocator);
+    primitive.morph = morph;
+    for (primitive.indices, 0..) |*index, corner| index.* = @intCast(corner);
+
+    faceNormals(primitive.vertices, null, 0);
+    if (primitive.morph) |*deltas| {
+        // Section 3.7.2.1 again: where the base primitive specifies no normals,
+        // flat normals are calculated for each morph target as well, from that
+        // target's displaced positions. Tangent displacements are ignored, and
+        // this parser never reads them, so nothing has to drop them here.
+        var target: u32 = 0;
+        while (target < deltas.target_count) : (target += 1)
+            faceNormals(primitive.vertices, deltas, target);
+    }
+}
+
+// The normal of each triangle, written to its three corners.
+//
+// `deltas` null is the base geometry. Otherwise the positions are displaced by
+// one target and the result is stored as that target's normal delta, which is
+// what the prepass adds to the base normal.
+//
+// A degenerate triangle names no plane. Its corners keep the value they already
+// carry, which is the (0, 1, 0) every vertex is initialised with, rather than
+// the NaN a normalized zero would produce and carry into the shading.
+fn faceNormals(vertices: []Vertex3D, deltas: ?*MorphDeltas, target: u32) void {
+    var corner: usize = 0;
+    while (corner + 3 <= vertices.len) : (corner += 3) {
+        var points: [3]Vec3 = undefined;
+        for (0..3) |offset| {
+            const at = corner + offset;
+            points[offset] = vertices[at].position;
+            if (deltas) |morph| {
+                const run = @as(usize, morph.target_count) * 3;
+                const base = at * run + @as(usize, target) * 3;
+                points[offset] += Vec3{
+                    morph.positions[base + 0],
+                    morph.positions[base + 1],
+                    morph.positions[base + 2],
+                };
+            }
+        }
+
+        const edge_a = points[1] - points[0];
+        const edge_b = points[2] - points[0];
+        const face = Vec3{
+            edge_a[1] * edge_b[2] - edge_a[2] * edge_b[1],
+            edge_a[2] * edge_b[0] - edge_a[0] * edge_b[2],
+            edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0],
+        };
+        const length_squared = @reduce(.Add, face * face);
+        if (length_squared <= 1e-24) continue;
+        const normal = face / @as(Vec3, @splat(@sqrt(length_squared)));
+
+        for (0..3) |offset| {
+            const at = corner + offset;
+            if (deltas) |morph| {
+                const run = @as(usize, morph.target_count) * 3;
+                const base = at * run + @as(usize, target) * 3;
+                const delta = normal - vertices[at].normal;
+                morph.normals[base + 0] = delta[0];
+                morph.normals[base + 1] = delta[1];
+                morph.normals[base + 2] = delta[2];
+            } else {
+                vertices[at].normal = normal;
+            }
+        }
+    }
 }
 
 // Per-triangle tangents and bitangents weighted by the UV gradient, accumulated

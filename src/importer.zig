@@ -390,9 +390,7 @@ fn buildMaterial(
             },
             .alpha_cutoff = source.alpha_cutoff,
             .double_sided = source.double_sided,
-            // KHR_materials_unlit is outside this stage's extension set, so the
-            // document carries no such flag and every material is lit.
-            .unlit = false,
+            .unlit = source.unlit,
         },
     };
 }
@@ -613,6 +611,11 @@ const Builder = struct {
     }
 
     pub fn visit(self: *Builder, node: scene_graph.Node) Error!bool {
+        // Meshes and lights are both visual features, and they are all this walk
+        // collects, so a hidden node is pruned with its whole subtree rather
+        // than skipped: nothing below it can be visible.
+        if (!node.visible) return false;
+
         if (self.doc.nodes[node.index].light) |light| {
             try self.lights.append(self.allocator, .{
                 .source = self.doc.lights[light],
@@ -622,6 +625,18 @@ const Builder = struct {
 
         const mesh = node.mesh orelse return true;
         const skin = self.doc.nodes[node.index].skin;
+
+        // Section 3.7.4: the determinant of the node's global transform is the
+        // winding of its primitives. What is baked into these vertices is the
+        // relative transform, so its sign is settled here; the rest of the
+        // product is the instance matrix, whose sign is per instance and
+        // belongs to the draw state rather than to the geometry.
+        //
+        // Skinned geometry is never baked, so there is nothing to settle for
+        // it. Its winding follows the joint matrices, which are per vertex and
+        // per frame, and no load-time list can answer for them.
+        const winding: mesh_merger.Winding = if (skin == null and
+            zm.determinant(node.relative)[0] < 0) .reverse else .keep;
 
         // A skinned mesh ignores its node transform entirely, because the joint
         // matrices carry it, so it is never baked, never merged and never
@@ -644,12 +659,13 @@ const Builder = struct {
                     primitive.streams,
                     @intCast(primitive.vertices.len),
                     primitive.indices,
+                    winding,
                 );
                 bake(destination, primitive.vertices, node.relative);
                 continue;
             }
 
-            try self.appendSeparate(node, primitive, material, skin, anchor);
+            try self.appendSeparate(node, primitive, material, skin, anchor, winding);
         }
         return true;
     }
@@ -661,6 +677,7 @@ const Builder = struct {
         material: u32,
         skin: ?u32,
         anchor: ?Slot,
+        winding: mesh_merger.Winding,
     ) Error!void {
         // Checked rather than assumed, for the reason anchorSlot is: the
         // template list is built by a walk over the document's nodes and this is
@@ -682,6 +699,9 @@ const Builder = struct {
         };
         errdefer mesh.deinit(self.allocator);
         mesh.indices = try self.allocator.dupe(u32, primitive.indices);
+        // The same rule the merger applies as it appends. Geometry that is not
+        // merged is still geometry a mirroring node turned inside out.
+        if (winding == .reverse) mesh_merger.reverseTriangles(mesh.indices);
 
         if (skin == null) bake(mesh.vertices, primitive.vertices, node.relative);
 
@@ -810,11 +830,23 @@ fn parseMeshes(allocator: Allocator, doc: *const Document) Error![][]mesh_parser
 // and joint data pass through: none of them is a position or a direction.
 fn bake(destination: []Vertex3D, source: []const Vertex3D, matrix: zm.Mat) void {
     const normals = scene_graph.normalMatrix(matrix);
+    // A mirroring transform turns the tangent basis over, so the lane that
+    // reconstructs the bitangent changes sign with it.
+    //
+    // Section 3.7.2.1 defines the bitangent as `cross(normal, tangent) * w`,
+    // and a cross product carried by a matrix picks up that matrix's
+    // determinant: `cross(aM, bM) = det(M) * cross(a, b) M^-T`. The two carried
+    // vectors therefore produce a cross product on the far side of the surface
+    // from the carried bitangent, and `w` is the only thing left to put it
+    // back. Leaving it alone lights a mirrored node through a tangent-space map
+    // read in a left-handed frame.
+    const handedness: f32 = if (zm.determinant(matrix)[0] < 0) -1 else 1;
     for (source, destination) |vertex, *baked| {
         baked.* = vertex;
         baked.position = scene_graph.transformPosition(vertex.position, matrix);
         baked.normal = scene_graph.transformDirection(vertex.normal, normals);
         baked.tangent = scene_graph.transformTangent(vertex.tangent, matrix);
+        baked.tangent[3] *= handedness;
     }
 }
 

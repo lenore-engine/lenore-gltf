@@ -29,6 +29,7 @@ fn node(transform: Transform) Node {
         .scale = transform.scale,
         .matrix = transform.matrix,
         .weights = &.{},
+        .visible = true,
     };
 }
 

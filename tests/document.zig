@@ -102,6 +102,16 @@ test "document: an extension this parser does not implement is refused when requ
         \\ "extensionsUsed":["KHR_draco_mesh_compression"]}
     );
     defer doc.deinit();
+
+    // The other direction of the same rule: an extension this parser does read
+    // off an object has to be declared before it is honoured, or the document
+    // is asking for behaviour it never announced. KHR_materials_unlit is the
+    // case with no properties of its own, so the declaration is the only thing
+    // separating it from an object the parser would otherwise ignore.
+    try expectRejected(
+        \\{"asset":{"version":"2.0"},
+        \\ "materials":[{"extensions":{"KHR_materials_unlit":{}}}]}
+    , error.InvalidStructure);
 }
 
 test "document: accessor shapes this parser refuses are named individually" {

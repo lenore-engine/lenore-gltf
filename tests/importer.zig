@@ -292,6 +292,47 @@ test "importer: an image is named, and only an embedded one is read" {
     try testing.expectEqual([3]f32{ 3, 3, 3 }, model.materials[0].factors.emissive);
 }
 
+test "importer: KHR_materials_unlit is a flag and leaves the fallback factors alone" {
+    // Required rather than used, which is the form all three corpus models take
+    // and the form that fails outright when the extension is not supported.
+    var doc = try load(one_triangle ++
+        \\ "materials":[{"pbrMetallicRoughness":{"baseColorFactor":[1,0,0,1],
+        \\                                       "metallicFactor":0,
+        \\                                       "roughnessFactor":0.9},
+        \\               "doubleSided":true,
+        \\               "alphaMode":"MASK",
+        \\               "alphaCutoff":0.25,
+        \\               "extensions":{"KHR_materials_unlit":{}}},
+        \\              {"pbrMetallicRoughness":{"baseColorFactor":[0,1,0,1]}}],
+        \\ "extensionsUsed":["KHR_materials_unlit"],
+        \\ "extensionsRequired":["KHR_materials_unlit"],
+        \\ "nodes":[{"mesh":0}],
+        \\ "scenes":[{"nodes":[0]}]}
+    );
+    defer doc.deinit();
+
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    const unlit = model.materials[0];
+    try testing.expect(unlit.rendering.unlit);
+
+    // The extension calls the PBR properties a fallback for clients without it,
+    // so they are carried through rather than normalized away. The base colour
+    // is the whole shading term and has to arrive unaltered.
+    try testing.expectEqual([4]f32{ 1, 0, 0, 1 }, unlit.factors.base_colour);
+    try testing.expectEqual(@as(f32, 0.9), unlit.factors.roughness);
+
+    // Alpha coverage and doubleSided still apply, in the extension's own words.
+    try testing.expectEqual(resources.MaterialInfo.Rendering.AlphaMode.mask, unlit.rendering.alpha_mode);
+    try testing.expectEqual(@as(f32, 0.25), unlit.rendering.alpha_cutoff);
+    try testing.expect(unlit.rendering.double_sided);
+
+    // The flag is per material, not per document: the second declares no
+    // extension and stays lit.
+    try testing.expect(!model.materials[1].rendering.unlit);
+}
+
 // The second half of the split above. `build` names a file and leaves it, and
 // this is what a consumer calls when it wants the bytes rather than the name.
 const file_backed_images = one_triangle ++
@@ -382,6 +423,47 @@ test "importer: a light carries the transform of the node that references it" {
     const world = model.lights[0].world;
     try testing.expectApproxEqAbs(@as(f32, 10.0), world[3][0], 1e-5);
     try testing.expectApproxEqAbs(@as(f32, 4.0), world[3][1], 1e-5);
+}
+
+test "importer: a hidden node takes its subtree with it, and its lights" {
+    // Node 0 is hidden and node 1 below it declares itself visible, which the
+    // extension does not honour: a false anywhere above is final. Node 2 is the
+    // control and is the only geometry that survives.
+    var doc = try load(one_triangle ++
+        \\ "materials":[{}],
+        \\ "extensionsUsed":["KHR_node_visibility","KHR_lights_punctual"],
+        \\ "extensions":{"KHR_lights_punctual":{"lights":[{"type":"point"}]}},
+        \\ "nodes":[{"children":[1],"mesh":0,"translation":[10,0,0],
+        \\           "extensions":{"KHR_node_visibility":{"visible":false}}},
+        \\          {"mesh":0,"translation":[0,10,0],
+        \\           "extensions":{"KHR_node_visibility":{"visible":true},
+        \\                         "KHR_lights_punctual":{"light":0}}},
+        \\          {"mesh":0,"translation":[0,0,10]}],
+        \\ "scenes":[{"nodes":[0,2]}]}
+    );
+    defer doc.deinit();
+
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), model.meshes.len);
+    const merged = model.meshes[0];
+    try testing.expectEqual(@as(usize, 3), merged.vertices.len);
+    try expectVec3(.{ 0, 0, 10 }, merged.vertices[0].position);
+
+    // A hidden node hides every visual feature it carries, not only its mesh.
+    try testing.expectEqual(@as(usize, 0), model.lights.len);
+}
+
+test "importer: a node extension used without being declared is refused" {
+    // Section 3.12 makes extensionsUsed the list of what an asset uses, so an
+    // extension object with no entry there is a malformed document rather than
+    // one this parser cannot render.
+    try testing.expectError(error.InvalidStructure, load(one_triangle ++
+        \\ "nodes":[{"mesh":0,
+        \\           "extensions":{"KHR_node_visibility":{"visible":false}}}],
+        \\ "scenes":[{"nodes":[0]}]}
+    ));
 }
 
 test "importer: a morph template carries the pose the mesh declares" {
@@ -584,4 +666,35 @@ test "importer: every allocation failure is propagated and nothing leaks" {
         } else |err| try testing.expectEqual(error.OutOfMemory, err);
     }
     try testing.expect(index > 20);
+}
+
+test "importer: a mirrored node bakes reversed winding and the other handedness" {
+    // Scale -1 in x is the smallest transform with a negative determinant.
+    // Section 3.7.4 makes that the winding of the primitive, and the geometry
+    // is baked here, so the index list is where it has to show.
+    var doc = try load(one_triangle ++
+        \\ "materials":[{}],
+        \\ "nodes":[{"mesh":0,"scale":[-1,1,1]},
+        \\          {"mesh":0,"translation":[0,10,0]}],
+        \\ "scenes":[{"nodes":[0,1]}]}
+    );
+    defer doc.deinit();
+
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    // One group: the mirrored node is merged with the plain one rather than
+    // split away from it, which is what reversing the corners is for.
+    try testing.expectEqual(@as(usize, 1), model.meshes.len);
+    const merged = model.meshes[0];
+    try testing.expectEqualSlices(u32, &.{ 0, 2, 1, 3, 4, 5 }, merged.indices);
+
+    // The primitive carries no TANGENT and no TEXCOORD_0, so mesh_parser leaves
+    // every vertex at the constant (1, 0, 0, 1) and the lane under test is the
+    // one the bake wrote.
+    for (merged.vertices[0..3]) |vertex| try testing.expectEqual(@as(f32, -1.0), vertex.tangent[3]);
+    for (merged.vertices[3..6]) |vertex| try testing.expectEqual(@as(f32, 1.0), vertex.tangent[3]);
+
+    // The mirror is in the geometry as well, not only in the index order.
+    try testing.expectApproxEqAbs(@as(f32, -1.0), merged.vertices[1].position[0], 1e-6);
 }

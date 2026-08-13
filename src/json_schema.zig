@@ -41,6 +41,11 @@ pub const NodeExtensions = struct {
     KHR_lights_punctual: ?struct {
         light: u32,
     } = null,
+    // KHR_node_visibility gives `visible` the default true, so an extension
+    // object present with no member reads as visible.
+    KHR_node_visibility: ?struct {
+        visible: bool = true,
+    } = null,
 };
 
 pub const Node = struct {
@@ -219,6 +224,11 @@ pub const MaterialExtensions = struct {
     KHR_materials_emissive_strength: ?struct {
         emissiveStrength: f32 = 1.0,
     } = null,
+    // KHR_materials_unlit adds no properties: the extension object is empty and
+    // its presence is the whole signal. The extension permits further members
+    // and leaves their meaning undefined, which is what the parser's
+    // ignore_unknown_fields already does with them.
+    KHR_materials_unlit: ?struct {} = null,
 };
 
 pub const Material = struct {

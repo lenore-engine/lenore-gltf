@@ -64,6 +64,8 @@ const supported_extensions = [_][]const u8{
     "KHR_texture_transform",
     "KHR_lights_punctual",
     "KHR_materials_emissive_strength",
+    "KHR_materials_unlit",
+    "KHR_node_visibility",
 };
 
 pub fn convert(arena: *ArenaAllocator, root: *const schema.Root) Error!Result {
@@ -158,6 +160,8 @@ fn validateExtensions(root: *const schema.Root) Error!void {
     for (root.materials) |material| {
         if (material.extensions.KHR_materials_emissive_strength != null)
             try requireExtension(root, "KHR_materials_emissive_strength");
+        if (material.extensions.KHR_materials_unlit != null)
+            try requireExtension(root, "KHR_materials_unlit");
         inline for (.{
             material.pbrMetallicRoughness.baseColorTexture,
             material.pbrMetallicRoughness.metallicRoughnessTexture,
@@ -175,6 +179,8 @@ fn validateExtensions(root: *const schema.Root) Error!void {
     for (root.nodes) |node| {
         if (node.extensions.KHR_lights_punctual != null)
             try requireExtension(root, "KHR_lights_punctual");
+        if (node.extensions.KHR_node_visibility != null)
+            try requireExtension(root, "KHR_node_visibility");
     }
 }
 
@@ -727,6 +733,7 @@ fn convertMaterials(allocator: std.mem.Allocator, root: *const schema.Root) Erro
             },
             .alpha_cutoff = source.alphaCutoff,
             .double_sided = source.doubleSided,
+            .unlit = source.extensions.KHR_materials_unlit != null,
         };
     }
     return output;
@@ -895,6 +902,10 @@ fn convertNodes(
             .scale = source.scale,
             .matrix = source.matrix,
             .weights = weights,
+            .visible = if (source.extensions.KHR_node_visibility) |extension|
+                extension.visible
+            else
+                true,
         };
     }
     return output;

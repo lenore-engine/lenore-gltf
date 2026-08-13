@@ -204,6 +204,11 @@ test "mesh parser: morph deltas interleave with the target index varying fastest
     // Two vertices, two targets. Target 0 carries positions and normals, target
     // 1 carries positions only, so the zero fill is what the second target's
     // normals must be.
+    //
+    // The base primitive declares NORMAL, and that is load-bearing rather than
+    // decoration: section 3.7.2.1 makes a base without normals a primitive
+    // whose targets are given calculated flat normals, so a supplied delta
+    // would not survive to be read here. Accessor 2 serves as both.
     const positions = floats(&.{ 0, 0, 0, 1, 0, 0 });
     const target0_positions = floats(&.{ 1, 0, 0, 2, 0, 0 });
     const target0_normals = floats(&.{ 0, 1, 0, 0, 2, 0 });
@@ -222,7 +227,7 @@ test "mesh parser: morph deltas interleave with the target index varying fastest
         \\              {"bufferView":2,"componentType":5126,"count":2,"type":"VEC3"},
         \\              {"bufferView":3,"componentType":5126,"count":2,"type":"VEC3"}],
         \\ "meshes":[{"weights":[0.5,0.25],
-        \\            "primitives":[{"attributes":{"POSITION":0},
+        \\            "primitives":[{"attributes":{"POSITION":0,"NORMAL":2},
         \\                           "targets":[{"POSITION":1,"NORMAL":2},{"POSITION":3}]}]}]}
     , &bytes);
     defer doc.deinit();
@@ -387,4 +392,80 @@ test "mesh parser: every allocation failure is propagated and nothing leaks" {
         } else |err| try testing.expectEqual(error.OutOfMemory, err);
     }
     try testing.expect(index > 0);
+}
+
+test "mesh parser: a primitive with no normals is split per face and given flat ones" {
+    // Two triangles sharing an edge and lying in different planes: 0,1,2 in the
+    // xy plane and 0,2,3 in the yz plane. Vertices 0 and 2 belong to both, and
+    // no single normal is right for them, which is the whole reason the
+    // geometry is expanded rather than annotated.
+    const positions = floats(&.{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 });
+    const indices = shorts(&.{ 0, 1, 2, 0, 2, 3 });
+
+    var doc = try load(
+        \\{"asset":{"version":"2.0"},
+        \\ "buffers":[{"byteLength":60,"uri":"b.bin"}],
+        \\ "bufferViews":[{"buffer":0,"byteLength":48},
+        \\                {"buffer":0,"byteOffset":48,"byteLength":12}],
+        \\ "accessors":[{"bufferView":0,"componentType":5126,"count":4,"type":"VEC3"},
+        \\              {"bufferView":1,"componentType":5123,"count":6,"type":"SCALAR"}],
+        \\ "meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}]}
+    , &(positions ++ indices));
+    defer doc.deinit();
+
+    var primitive = try mesh_parser.parsePrimitive(testing.allocator, &doc, doc.meshes[0].primitives[0]);
+    defer primitive.deinit(testing.allocator);
+
+    // One vertex per corner, and the index list is the identity that leaves.
+    try testing.expectEqual(@as(usize, 6), primitive.vertices.len);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5 }, primitive.indices);
+
+    // The first face is wound counter-clockwise seen from +z and the second
+    // from +x, which is what the two cross products give.
+    for (primitive.vertices[0..3]) |vertex| try expectVec3(.{ 0, 0, 1 }, vertex.normal);
+    for (primitive.vertices[3..6]) |vertex| try expectVec3(.{ 1, 0, 0 }, vertex.normal);
+
+    // Corners 0 and 3 are the same source vertex carrying two different
+    // normals, which an unsplit list could not express.
+    try expectVec3(.{ 0, 0, 0 }, primitive.vertices[0].position);
+    try expectVec3(.{ 0, 0, 0 }, primitive.vertices[3].position);
+}
+
+test "mesh parser: a morph target of a primitive with no normals gets flat ones" {
+    // Section 3.7.2.1: where the base primitive specifies no normals, flat
+    // normals are calculated for each morph target too, from that target's
+    // displaced geometry. One triangle in the xy plane whose target swings its
+    // third corner from +y round to +z, so the displaced face lies in another
+    // plane and its normal is not the base's.
+    const positions = floats(&.{ 0, 0, 0, 1, 0, 0, 0, 1, 0 });
+    // Only the third corner moves, from (0, 1, 0) to (0, 0, 1).
+    const target = floats(&.{ 0, 0, 0, 0, 0, 0, 0, -1, 1 });
+
+    var doc = try load(
+        \\{"asset":{"version":"2.0"},
+        \\ "buffers":[{"byteLength":72,"uri":"b.bin"}],
+        \\ "bufferViews":[{"buffer":0,"byteLength":36},
+        \\                {"buffer":0,"byteOffset":36,"byteLength":36}],
+        \\ "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},
+        \\              {"bufferView":1,"componentType":5126,"count":3,"type":"VEC3"}],
+        \\ "meshes":[{"primitives":[{"attributes":{"POSITION":0},
+        \\                           "targets":[{"POSITION":1}]}]}]}
+    , &(positions ++ target));
+    defer doc.deinit();
+
+    var primitive = try mesh_parser.parsePrimitive(testing.allocator, &doc, doc.meshes[0].primitives[0]);
+    defer primitive.deinit(testing.allocator);
+
+    const morph = primitive.morph orelse return error.TestExpectedMorph;
+    try testing.expectEqual(@as(usize, 9), morph.normals.len);
+
+    // The corner moves from (0, 1, 0) to (0, 0, 1), which lays the triangle in
+    // the xz plane: the base face points along +z and the displaced one along
+    // -y, so the delta the prepass adds is their difference.
+    for (primitive.vertices) |vertex| try expectVec3(.{ 0, 0, 1 }, vertex.normal);
+    for (0..3) |corner| {
+        try testing.expectApproxEqAbs(@as(f32, 0.0), morph.normals[corner * 3 + 0], 1e-5);
+        try testing.expectApproxEqAbs(@as(f32, -1.0), morph.normals[corner * 3 + 1], 1e-5);
+        try testing.expectApproxEqAbs(@as(f32, -1.0), morph.normals[corner * 3 + 2], 1e-5);
+    }
 }

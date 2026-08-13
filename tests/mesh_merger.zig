@@ -38,6 +38,7 @@ test "mesh merger: primitives sharing a group concatenate with rebased indices" 
         .{},
         3,
         &.{ 0, 1, 2 },
+        .keep,
     ), 1.0);
     fill(try merger.appendPrimitive(
         testing.allocator,
@@ -46,6 +47,7 @@ test "mesh merger: primitives sharing a group concatenate with rebased indices" 
         .{},
         2,
         &.{ 1, 0 },
+        .keep,
     ), 4.0);
 
     try testing.expectEqual(@as(usize, 1), merger.groups.count());
@@ -64,16 +66,16 @@ test "mesh merger: anchor, material and skinning each split a group" {
     var merger: Merger = .empty;
     defer merger.deinit(testing.allocator);
 
-    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{}, 1, &.{0}), 1.0);
+    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{}, 1, &.{0}, .keep), 1.0);
     // A different material renders with a different texture set and cull state.
-    fill(try merger.appendPrimitive(testing.allocator, null, 1, .{}, 1, &.{0}), 2.0);
+    fill(try merger.appendPrimitive(testing.allocator, null, 1, .{}, 1, &.{0}, .keep), 2.0);
     // A different anchor moves under a different instance matrix.
-    fill(try merger.appendPrimitive(testing.allocator, 7, 0, .{}, 1, &.{0}), 3.0);
+    fill(try merger.appendPrimitive(testing.allocator, 7, 0, .{}, 1, &.{0}, .keep), 3.0);
     // No material at all is the default material, not material zero.
-    fill(try merger.appendPrimitive(testing.allocator, null, null, .{}, 1, &.{0}), 4.0);
+    fill(try merger.appendPrimitive(testing.allocator, null, null, .{}, 1, &.{0}, .keep), 4.0);
     // Skinning has no neutral default: merging these two would leave the first
     // primitive's vertices with zero weights, collapsing them onto the origin.
-    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{ .skinned = true }, 1, &.{0}), 5.0);
+    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{ .skinned = true }, 1, &.{0}, .keep), 5.0);
 
     try testing.expectEqual(@as(usize, 5), merger.groups.count());
     // Insertion order is iteration order, so the submesh list is the same on
@@ -95,11 +97,11 @@ test "mesh merger: optional streams are the union of the merged primitives" {
     var merger: Merger = .empty;
     defer merger.deinit(testing.allocator);
 
-    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{ .colour = true }, 1, &.{0}), 1.0);
-    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{ .uv1 = true }, 1, &.{0}), 2.0);
+    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{ .colour = true }, 1, &.{0}, .keep), 1.0);
+    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{ .uv1 = true }, 1, &.{0}, .keep), 2.0);
     // Neither stream, and the group keeps both: this primitive contributes the
     // interchange defaults, which are white and (0, 0).
-    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{}, 1, &.{0}), 3.0);
+    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{}, 1, &.{0}, .keep), 3.0);
 
     try testing.expectEqual(@as(usize, 1), merger.groups.count());
     const streams = merger.groups.values()[0].streams;
@@ -112,10 +114,10 @@ test "mesh merger: an index outside its own primitive is refused" {
     var merger: Merger = .empty;
     defer merger.deinit(testing.allocator);
 
-    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{}, 2, &.{ 0, 1 }), 1.0);
+    fill(try merger.appendPrimitive(testing.allocator, null, 0, .{}, 2, &.{ 0, 1 }, .keep), 1.0);
     try testing.expectError(
         error.VertexIndexOutOfRange,
-        merger.appendPrimitive(testing.allocator, null, 0, .{}, 2, &.{ 0, 2 }),
+        merger.appendPrimitive(testing.allocator, null, 0, .{}, 2, &.{ 0, 2 }, .keep),
     );
 
     // The rejected primitive left nothing behind.
@@ -143,7 +145,7 @@ test "mesh merger: a failed reservation leaves no group behind and nothing alloc
         var merger: Merger = .empty;
         defer merger.deinit(allocator);
 
-        if (merger.appendPrimitive(allocator, null, 0, .{}, 3, &.{ 0, 1, 2 })) |vertices| {
+        if (merger.appendPrimitive(allocator, null, 0, .{}, 3, &.{ 0, 1, 2 }, .keep)) |vertices| {
             fill(vertices, 1.0);
         } else |err| {
             try testing.expectEqual(error.OutOfMemory, err);
@@ -151,7 +153,7 @@ test "mesh merger: a failed reservation leaves no group behind and nothing alloc
             continue;
         }
 
-        if (merger.appendPrimitive(allocator, null, 1, .{}, 3, &.{ 0, 1, 2 })) |vertices| {
+        if (merger.appendPrimitive(allocator, null, 1, .{}, 3, &.{ 0, 1, 2 }, .keep)) |vertices| {
             fill(vertices, 4.0);
             try testing.expectEqual(@as(usize, 2), merger.groups.count());
             break;
@@ -162,4 +164,58 @@ test "mesh merger: a failed reservation leaves no group behind and nothing alloc
         }
     }
     try testing.expect(index > 2);
+}
+
+test "mesh merger: a mirrored primitive is appended with its triangles reversed" {
+    var merger: Merger = .empty;
+    defer merger.deinit(testing.allocator);
+
+    fill(try merger.appendPrimitive(
+        testing.allocator,
+        null,
+        0,
+        .{},
+        6,
+        &.{ 0, 1, 2, 3, 4, 5 },
+        .reverse,
+    ), 1.0);
+    // A primitive the same group already holds, wound the other way. Both are
+    // in one group, so the reversal has to be per primitive rather than per
+    // group, and the rebase still applies to the corners it moved.
+    fill(try merger.appendPrimitive(
+        testing.allocator,
+        null,
+        0,
+        .{},
+        3,
+        &.{ 0, 1, 2 },
+        .keep,
+    ), 7.0);
+
+    const group = merger.groups.values()[0];
+    try testing.expectEqualSlices(
+        u32,
+        &.{ 0, 2, 1, 3, 5, 4, 6, 7, 8 },
+        group.indices.items,
+    );
+}
+
+test "mesh merger: a reversed stream that is not whole triangles keeps its tail" {
+    var merger: Merger = .empty;
+    defer merger.deinit(testing.allocator);
+
+    // Four corners is one triangle and a corner left over. The remainder names
+    // no triangle to turn round, and reading a third corner for it would be a
+    // read past the end.
+    fill(try merger.appendPrimitive(
+        testing.allocator,
+        null,
+        0,
+        .{},
+        4,
+        &.{ 0, 1, 2, 3 },
+        .reverse,
+    ), 1.0);
+
+    try testing.expectEqualSlices(u32, &.{ 0, 2, 1, 3 }, merger.groups.values()[0].indices.items);
 }

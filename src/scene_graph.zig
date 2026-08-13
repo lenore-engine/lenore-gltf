@@ -28,6 +28,12 @@ pub const Node = struct {
     // draw of a merged group follow its animation.
     relative: zm.Mat,
     mesh: ?u32,
+    // KHR_node_visibility, inherited: false when this node or any ancestor
+    // declares `visible` false. The extension hides everything a node renders,
+    // meshes and light sources alike, and leaves cameras alone, so the walk
+    // carries the value and each visitor decides what it means for what it
+    // collects.
+    visible: bool,
 };
 
 // Walk one scene depth first, calling `visitor.visit(node)` for each node. The
@@ -51,7 +57,7 @@ pub fn traverse(
 ) !void {
     if (scene_index >= doc.scenes.len) return error.IndexOutOfRange;
     for (doc.scenes[scene_index].nodes) |root| {
-        try visit(doc, root, dynamic, zm.identity(), zm.identity(), null, visitor);
+        try visit(doc, root, dynamic, zm.identity(), zm.identity(), null, true, visitor);
     }
 }
 
@@ -64,6 +70,7 @@ fn visit(
     parent_world: zm.Mat,
     parent_relative: zm.Mat,
     parent_anchor: ?u32,
+    parent_visible: bool,
     visitor: anytype,
 ) !void {
     const node = doc.nodes[index];
@@ -88,17 +95,22 @@ fn visit(
     else
         world;
 
+    // A visible node under a hidden parent stays hidden: the extension makes a
+    // false anywhere on the path final for everything below it.
+    const visible = parent_visible and node.visible;
+
     const descend = try visitor.visit(Node{
         .index = index,
         .world = world,
         .anchor = anchor,
         .relative = relative,
         .mesh = node.mesh,
+        .visible = visible,
     });
     if (!descend) return;
 
     for (node.children) |child| {
-        try visit(doc, child, dynamic, world, relative, anchor, visitor);
+        try visit(doc, child, dynamic, world, relative, anchor, visible, visitor);
     }
 }
 

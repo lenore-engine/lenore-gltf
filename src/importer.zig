@@ -79,9 +79,15 @@ pub const Mesh = struct {
     // consumer past load, and resolving it per draw would mean carrying the map
     // that resolves it for as long as the model is alive.
     anchor: ?Slot,
-    // The skin this geometry is bound to. A skinned mesh keeps its vertices in
-    // local space, because the joint matrices carry the transform.
-    skin: ?u32,
+    // Where this geometry's joints live: which skeleton, and the run of joint
+    // transforms inside it that the vertex attribute indexes. A skinned mesh
+    // keeps its vertices in local space, because the joint matrices carry the
+    // transform.
+    //
+    // Resolved here rather than carried as the document's skin index, for the
+    // reason `anchor` is a slot: several skins may share one skeleton, so the
+    // document index alone no longer says where to read.
+    skin: ?animation_parser.SkinPlacement,
     // The weights that blend this geometry's morph targets, as an index into
     // Model.morph_templates, and null when it has none. Present exactly when
     // `morph` is.
@@ -111,17 +117,32 @@ pub const Light = struct {
     world: zm.Mat,
 };
 
+// One skeleton: a hierarchy and the clips rebased onto its slots.
+//
+// Not one per document skin. A skeleton is a connected component of the joint
+// forest, so several skins share it whenever their joints do, which is what lets
+// a joint carried by one skin drive a joint of another. A mesh names the run of
+// joints it reads through `Mesh.skin`. See `animation_parser.buildSkeletons`.
+// Re-exported where a mesh's `skin` field is read, so a consumer of the model
+// names one module rather than two.
+pub const SkinPlacement = animation_parser.SkinPlacement;
+pub const PrefixLink = animation_parser.PrefixLink;
+
 pub const Skin = struct {
     skeleton: resources.SkeletonTemplate,
     // Every clip in the document, addressed by this skeleton's slots. All of
     // them, not the first: which clip plays is playback's choice.
     clips: []resources.Animation,
-    index: u32,
+    // The root slots whose transform above them is not a constant, and the
+    // rigid animation slot each one follows. Empty for a skeleton hanging below
+    // nothing that moves, which is most of them.
+    prefix_links: []animation_parser.PrefixLink,
 
     pub fn deinit(self: *Skin, allocator: Allocator) void {
         self.skeleton.deinit(allocator);
         for (self.clips) |*clip| clip.deinit(allocator);
         allocator.free(self.clips);
+        allocator.free(self.prefix_links);
         self.* = undefined;
     }
 };
@@ -192,7 +213,6 @@ pub fn build(
 
     model.images = try buildImages(allocator, doc, directory);
     model.materials = try buildMaterials(allocator, doc, model.images);
-    model.skins = try buildSkins(allocator, doc);
 
     // Load-time scratch, both of them. One turns the scene walk's node anchors
     // into the slots the meshes carry and the other its morphed nodes into
@@ -203,6 +223,9 @@ pub fn build(
     const node_to_morph = try allocator.alloc(?u32, doc.nodes.len);
     defer allocator.free(node_to_morph);
 
+    // Before the skeletons, and that order is load-bearing: a skeleton hanging
+    // below an animated node keeps a link to that node's slot instead of
+    // folding its transform in, and the slots are what this produces.
     if (try animation_parser.parseNodeAnimation(allocator, doc, node_to_slot)) |parsed| {
         var template = parsed;
         // Discharged once the box holds it. Until then the parse owns every
@@ -212,8 +235,15 @@ pub fn build(
         boxed.* = template;
         model.node_animation = boxed;
     }
+
+    // Dense over the document's skins, and load-time scratch like the two maps
+    // above: a mesh keeps the placement it needs, so nothing past the build asks
+    // where a document skin went.
+    var skin_placements: []?animation_parser.SkinPlacement = &.{};
+    defer allocator.free(skin_placements);
+    model.skins = try buildSkins(allocator, doc, node_to_slot, &skin_placements);
     model.morph_templates = try buildMorphTemplates(allocator, doc, node_to_morph);
-    try buildGeometry(allocator, doc, &model, node_to_slot, node_to_morph);
+    try buildGeometry(allocator, doc, &model, node_to_slot, node_to_morph, skin_placements);
     return model;
 }
 
@@ -427,21 +457,31 @@ fn uvTransform(uv: types.TexCoord) MaterialInfo.TextureMaps.UvTransform {
     return .{ .set = uv.set, .offset = uv.offset, .rotation = uv.rotation, .scale = uv.scale };
 }
 
-fn buildSkins(allocator: Allocator, doc: *const Document) Error![]Skin {
+// One `Skin` per skeleton, and the placement of every document skin inside one.
+//
+// The placements are returned rather than looked up later because they are what
+// a mesh needs: `buildSkeletons` is the only thing that knows which skeleton a
+// document skin landed in and where its joints sit in it.
+fn buildSkins(
+    allocator: Allocator,
+    doc: *const Document,
+    node_to_slot: []const ?Slot,
+    placements: *[]?animation_parser.SkinPlacement,
+) Error![]Skin {
+    const built = try animation_parser.buildSkeletons(allocator, doc, node_to_slot);
+    defer {
+        for (built.hierarchies) |*hierarchy| hierarchy.deinit(allocator);
+        allocator.free(built.hierarchies);
+    }
+    errdefer allocator.free(built.placements);
+
     var skins: std.ArrayList(Skin) = .empty;
     errdefer {
         for (skins.items) |*skin| skin.deinit(allocator);
         skins.deinit(allocator);
     }
 
-    for (0..doc.skins.len) |index| {
-        var hierarchy = (try animation_parser.buildJointHierarchy(
-            allocator,
-            doc,
-            @intCast(index),
-        )) orelse continue;
-        defer hierarchy.deinit(allocator);
-
+    for (built.hierarchies) |*hierarchy| {
         var skeleton = try resources.SkeletonTemplate.init(allocator, hierarchy.templateInit());
         errdefer skeleton.deinit(allocator);
 
@@ -461,21 +501,24 @@ fn buildSkins(allocator: Allocator, doc: *const Document) Error![]Skin {
             parsed += 1;
         }
 
+        const links = try allocator.dupe(animation_parser.PrefixLink, hierarchy.prefix_links);
+        errdefer allocator.free(links);
+
         try skins.append(allocator, .{
             .skeleton = skeleton,
             .clips = clips,
-            .index = @intCast(index),
+            .prefix_links = links,
         });
     }
-    return skins.toOwnedSlice(allocator);
+
+    // After the last call that can fail, and not before: the errdefer above
+    // still owns the placements until the caller does, and handing them over
+    // first would leave both of us freeing them.
+    const owned = try skins.toOwnedSlice(allocator);
+    placements.* = built.placements;
+    return owned;
 }
 
-// One template per node that instantiates a mesh with morph targets, and the map
-// from the document's nodes onto them that the geometry walk reads.
-//
-// A node with such a mesh earns a template whether or not anything animates it:
-// section 3.7.4 gives it a pose of its own, and a mesh whose weights never change
-// still has to be blended by them.
 fn buildMorphTemplates(
     allocator: Allocator,
     doc: *const Document,
@@ -595,6 +638,8 @@ const Builder = struct {
     // either without a bound.
     node_to_slot: []const ?Slot,
     node_to_morph: []const ?u32,
+    // Dense over the document's skins, from the skeleton build.
+    skin_placements: []const ?animation_parser.SkinPlacement,
 
     // The scene walk anchors geometry to a slotted node, and the animation parser
     // gave a slot to exactly the slotted nodes the default scene reaches. Both
@@ -624,7 +669,12 @@ const Builder = struct {
         }
 
         const mesh = node.mesh orelse return true;
-        const skin = self.doc.nodes[node.index].skin;
+        // Section 3.7.3.3: the node names the skin its primitives index. A skin
+        // with no joints places nothing, and its geometry then draws rigid.
+        const skin: ?animation_parser.SkinPlacement = if (self.doc.nodes[node.index].skin) |index|
+            self.skin_placements[index]
+        else
+            null;
 
         // Section 3.7.4: the determinant of the node's global transform is the
         // winding of its primitives. What is baked into these vertices is the
@@ -675,7 +725,7 @@ const Builder = struct {
         node: scene_graph.Node,
         primitive: mesh_parser.Primitive,
         material: u32,
-        skin: ?u32,
+        skin: ?animation_parser.SkinPlacement,
         anchor: ?Slot,
         winding: mesh_merger.Winding,
     ) Error!void {
@@ -735,6 +785,7 @@ fn buildGeometry(
     model: *Model,
     node_to_slot: []const ?Slot,
     node_to_morph: []const ?u32,
+    skin_placements: []const ?animation_parser.SkinPlacement,
 ) Error!void {
     var info = try dynamic_nodes.collect(allocator, doc);
     defer info.deinit(allocator);
@@ -764,6 +815,7 @@ fn buildGeometry(
         .default_material = @intCast(doc.materials.len),
         .node_to_slot = node_to_slot,
         .node_to_morph = node_to_morph,
+        .skin_placements = skin_placements,
     };
 
     // Section 3.5.1 leaves `scene` optional; scene zero is the choice made in

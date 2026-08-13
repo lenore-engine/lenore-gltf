@@ -34,31 +34,72 @@ fn defaultSceneRoots(doc: *const Document) []const u32 {
     return doc.scenes[doc.default_scene orelse 0].nodes;
 }
 
-// The accumulated world transform of everything above `target`, not including
-// its own local transform. Identity when `target` is a scene root or is not
-// reachable from the default scene.
+// What sits above a root slot: the part of the chain that never moves, and the
+// rigid animation slot carrying the rest.
 //
+// The walk stops at the nearest ancestor the rigid hierarchy drives, because
+// everything from there upward is that node's world transform and is not a
+// constant. Below it the chain is static and folds into one matrix, so a root
+// costs one multiplication either way.
+//
+// Identity and no link when `target` is a scene root or is not reachable from
+// the default scene.
+const Above = struct {
+    static: zm.Mat,
+    node_slot: ?Slot,
+};
+
 // Linear in the graph per call, so building a skeleton whose roots are deep
-// costs one walk per root. That is the shape worth keeping only because a skin
-// has few roots; the rigid hierarchy below accumulates during its single walk
-// instead, which is what keeps it linear over hundreds of subtrees.
-fn ancestorPrefix(doc: *const Document, target: u32) zm.Mat {
+// costs one walk per root. That is the shape worth keeping only because a
+// skeleton has few roots; the rigid hierarchy below accumulates during its
+// single walk instead, which is what keeps it linear over hundreds of subtrees.
+fn ancestorPrefix(doc: *const Document, node_to_slot: []const ?Slot, target: u32) Above {
     for (defaultSceneRoots(doc)) |root| {
-        if (findAncestorPrefix(doc, root, zm.identity(), target)) |prefix| return prefix;
+        if (findAncestorPrefix(doc, node_to_slot, root, target)) |above| return above;
     }
-    return zm.identity();
+    return .{ .static = zm.identity(), .node_slot = null };
 }
 
-fn findAncestorPrefix(doc: *const Document, node: u32, accumulated: zm.Mat, target: u32) ?zm.Mat {
-    if (node == target) return accumulated;
+fn findAncestorPrefix(
+    doc: *const Document,
+    node_to_slot: []const ?Slot,
+    node: u32,
+    target: u32,
+) ?Above {
+    if (node == target) return .{ .static = zm.identity(), .node_slot = null };
 
-    // Row vector convention: the child's local transform comes first.
-    const world = zm.mul(node_transform.nodeLocalMatrix(doc.nodes[node], .{}), accumulated);
     for (doc.nodes[node].children) |child| {
-        if (findAncestorPrefix(doc, child, world, target)) |prefix| return prefix;
+        const below = findAncestorPrefix(doc, node_to_slot, child, target) orelse continue;
+        // Already stopped further down: this node is above the one that moves,
+        // so its transform is that node's business rather than the prefix's.
+        if (below.node_slot != null) return below;
+        if (node_to_slot[node]) |slot| return .{ .static = below.static, .node_slot = slot };
+        // Row vector convention: the child's local transform comes first, so
+        // the chain accumulates on the way back out.
+        return .{
+            .static = zm.mul(below.static, node_transform.nodeLocalMatrix(doc.nodes[node], .{})),
+            .node_slot = null,
+        };
     }
     return null;
 }
+
+// A root slot whose transform above it moves, and the rigid animation slot it
+// follows.
+//
+// glTF 2.0, 3.7.3.2 takes the skinned mesh node's own transform out of the
+// draw, and that is where the reading usually stops. It does not take the
+// chain above the *joints* out of anything: a skeleton parented under an
+// animated node moves with it, and `BrainStem` is the corpus's proof, hanging
+// its eighteen joints below a node carrying 1309 keys.
+//
+// So the transform above a root is baked only as far as the nearest ancestor
+// that the rigid hierarchy drives, and the rest is this link. `Pose.setRootPrefix`
+// is what closes it each frame.
+pub const PrefixLink = struct {
+    slot: Slot,
+    node_slot: Slot,
+};
 
 // The slot space of one skin, plus the map that rebases channels into it. The
 // caller keeps both alive together: the template copies what it needs, and the
@@ -73,6 +114,9 @@ pub const JointHierarchy = struct {
     joint_slot: []u16,
     // Dense over the document's nodes, null for a node with no slot.
     node_to_slot: []?Slot,
+    // One per root slot whose prefix is not a constant. Empty is the common
+    // case: a skeleton under nothing that moves.
+    prefix_links: []PrefixLink,
 
     pub fn templateInit(self: *const JointHierarchy) SkeletonTemplate.Init {
         return .{
@@ -95,6 +139,7 @@ pub const JointHierarchy = struct {
         allocator.free(self.inverse_bind);
         allocator.free(self.joint_slot);
         allocator.free(self.node_to_slot);
+        allocator.free(self.prefix_links);
         self.* = undefined;
     }
 };
@@ -105,6 +150,12 @@ pub const JointHierarchy = struct {
 const SkinSlots = struct {
     doc: *const Document,
     member: *const std.DynamicBitSetUnmanaged,
+    // The rigid hierarchy's slot per node, for the chain above a root. Not to
+    // be confused with `node_to_slot` below, which is this skeleton's own map
+    // and is written rather than read.
+    rigid_of_node: []const ?Slot,
+    links: *std.ArrayList(PrefixLink),
+    allocator: Allocator,
     slot_parent: []Slot,
     slot_prefix: []zm.Mat,
     bind_translations: []zm.Vec,
@@ -113,44 +164,91 @@ const SkinSlots = struct {
     node_to_slot: []?Slot,
     next: Slot = 0,
 
-    fn visit(self: *SkinSlots, node: u32, ancestor: Slot) void {
+    fn visit(self: *SkinSlots, node: u32, ancestor: Slot) Allocator.Error!void {
         var inherited = ancestor;
         if (self.member.isSet(node) and self.node_to_slot[node] == null) {
             const slot = self.next;
             self.next += 1;
             self.node_to_slot[node] = slot;
             self.slot_parent[slot] = ancestor;
-            // A root slot folds in the static chain above it. An interior one
-            // receives that chain through its parent's world transform, so
-            // giving it a prefix as well would apply the chain twice.
-            self.slot_prefix[slot] = if (ancestor == no_parent)
-                ancestorPrefix(self.doc, node)
-            else
-                zm.identity();
+            // A root slot folds in the static chain above it, and keeps a link
+            // to whatever above that moves. An interior one receives the chain
+            // through its parent's world transform, so giving it a prefix as
+            // well would apply it twice.
+            if (ancestor == no_parent) {
+                const above = ancestorPrefix(self.doc, self.rigid_of_node, node);
+                self.slot_prefix[slot] = above.static;
+                if (above.node_slot) |node_slot|
+                    try self.links.append(self.allocator, .{ .slot = slot, .node_slot = node_slot });
+            } else {
+                self.slot_prefix[slot] = zm.identity();
+            }
             const trs = node_transform.nodeTrs(self.doc.nodes[node], .{});
             self.bind_translations[slot] = trs.translation;
             self.bind_rotations[slot] = trs.rotation;
             self.bind_scales[slot] = trs.scale;
             inherited = slot;
         }
-        for (self.doc.nodes[node].children) |child| self.visit(child, inherited);
+        for (self.doc.nodes[node].children) |child| try self.visit(child, inherited);
     }
 };
 
-// The slot hierarchy of one skin, or null when the index names no skin.
+// Where one document skin's joints sit inside the skeleton that carries them.
 //
-// The slot set is the skin's joints plus every node lying strictly between a
-// joint and its nearest joint ancestor. Exporters routinely interpose helper
-// nodes there, for scale compensation or for orientation, and dropping them
-// freezes every joint reachable only through one.
-pub fn buildJointHierarchy(
+// The joint index space is the skin's own, because that is what the vertex
+// attribute addresses, and a skeleton holds the joints of every skin in it laid
+// end to end. So a mesh reads the run `[joint_offset, joint_offset + joint_count)`
+// of its skeleton's joint transforms, and needs no rebase of its own.
+pub const SkinPlacement = struct {
+    skeleton: u32,
+    joint_offset: u32,
+    joint_count: u32,
+};
+
+// One hierarchy per connected component of the document's joint forest, and
+// where each skin landed in it.
+pub const Skeletons = struct {
+    hierarchies: []JointHierarchy,
+    // Dense over the document's skins. Null for a skin with no joints at all,
+    // which has nothing to place.
+    placements: []?SkinPlacement,
+
+    pub fn deinit(self: *Skeletons, allocator: Allocator) void {
+        for (self.hierarchies) |*hierarchy| hierarchy.deinit(allocator);
+        allocator.free(self.hierarchies);
+        allocator.free(self.placements);
+        self.* = undefined;
+    }
+};
+
+// Every skeleton the document needs, one per component of the joint forest.
+//
+// **A skeleton is not a skin.** Two skins whose joints share a tree are one
+// hierarchy here, because the transform of a joint in one of them may be what
+// carries a joint of the other: `RecursiveSkeletons` nests 84 skins that way,
+// 80 of them rooted under a joint belonging to another skin, twenty deep. Built
+// per skin, each one would end at its own topmost joint and fold everything
+// above into a constant, which freezes the parent's motion out of the child.
+//
+// Godot resolves the same ambiguity the same way and says so where it does it:
+// `modules/gltf/skin_tool.cpp:314`, "combine all skins that are actually
+// branches of a main skeleton", reached through a disjoint set over the nodes
+// and a pass that unions groups whose highest member is parented into another
+// group. The specification does not settle it, which that comment also says.
+//
+// Sharing is what makes it cheaper as well as correct: a joint carried by
+// several skins is evaluated once for all of them rather than once per skin, and
+// the clips are rebased into one slot space rather than into 84.
+//
+// The slot set of a component is its joints plus every node lying strictly
+// between a joint and its nearest joint ancestor. Exporters routinely interpose
+// helper nodes there, for scale compensation or for orientation, and dropping
+// them freezes every joint reachable only through one.
+pub fn buildSkeletons(
     allocator: Allocator,
     doc: *const Document,
-    skin_index: u32,
-) Error!?JointHierarchy {
-    if (skin_index >= doc.skins.len) return null;
-    const skin = doc.skins[skin_index];
-
+    rigid_of_node: []const ?Slot,
+) Error!Skeletons {
     // Direct parent per node. validate.zig proved the graph is a forest, so one
     // pass over the children arrays is the whole relation.
     const parent_of = try allocator.alloc(?u32, doc.nodes.len);
@@ -160,23 +258,143 @@ pub fn buildJointHierarchy(
         for (node.children) |child| parent_of[child] = @intCast(index);
     }
 
+    // Every joint of every skin, and one skin that claims each. The claim is
+    // arbitrary among the skins sharing a joint and is only used to name the
+    // set a node belongs to.
+    var is_joint: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, doc.nodes.len);
+    defer is_joint.deinit(allocator);
+    const claimed_by = try allocator.alloc(u32, doc.nodes.len);
+    defer allocator.free(claimed_by);
+    for (doc.skins, 0..) |skin, index| {
+        for (skin.joints) |joint| {
+            if (!is_joint.isSet(joint)) claimed_by[joint] = @intCast(index);
+            is_joint.set(joint);
+        }
+    }
+
+    // Union skins that touch. A skin joins another when it shares a joint with
+    // it, and when the chain above one of its joints reaches a joint of the
+    // other: the second case is the nested skeleton, and it is the one a
+    // per-skin build gets wrong.
+    const component_of = try allocator.alloc(u32, doc.skins.len);
+    defer allocator.free(component_of);
+    for (component_of, 0..) |*owner, index| owner.* = @intCast(index);
+    for (doc.skins, 0..) |skin, index| {
+        for (skin.joints) |joint| {
+            if (claimed_by[joint] != index) union2(component_of, @intCast(index), claimed_by[joint]);
+            var above = parent_of[joint];
+            while (above) |node| : (above = parent_of[node]) {
+                if (!is_joint.isSet(node)) continue;
+                union2(component_of, @intCast(index), claimed_by[node]);
+                break;
+            }
+        }
+    }
+
+    // Dense component numbers, in ascending order of the first skin in each, so
+    // a document whose skins do not touch keeps them in its own order.
+    const number = try allocator.alloc(?u32, doc.skins.len);
+    defer allocator.free(number);
+    @memset(number, null);
+    var components: u32 = 0;
+    for (0..doc.skins.len) |index| {
+        const root = find(component_of, @intCast(index));
+        if (number[root] == null) {
+            number[root] = components;
+            components += 1;
+        }
+    }
+
+    const placements = try allocator.alloc(?SkinPlacement, doc.skins.len);
+    errdefer allocator.free(placements);
+    @memset(placements, null);
+
+    var hierarchies: std.ArrayList(JointHierarchy) = .empty;
+    errdefer {
+        for (hierarchies.items) |*hierarchy| hierarchy.deinit(allocator);
+        hierarchies.deinit(allocator);
+    }
+
+    var component: u32 = 0;
+    while (component < components) : (component += 1) {
+        var built = try buildComponent(
+            allocator,
+            doc,
+            rigid_of_node,
+            parent_of,
+            component_of,
+            number,
+            component,
+            placements,
+            @intCast(hierarchies.items.len),
+        );
+        errdefer built.deinit(allocator);
+        try hierarchies.append(allocator, built);
+    }
+
+    return .{
+        .hierarchies = try hierarchies.toOwnedSlice(allocator),
+        .placements = placements,
+    };
+}
+
+fn find(component_of: []u32, index: u32) u32 {
+    var root = index;
+    while (component_of[root] != root) root = component_of[root];
+    // Path compression, so the walk above stays short on a deep chain of
+    // unions. RecursiveSkeletons unions 84 skins one at a time.
+    var walk = index;
+    while (component_of[walk] != root) {
+        const next = component_of[walk];
+        component_of[walk] = root;
+        walk = next;
+    }
+    return root;
+}
+
+fn union2(component_of: []u32, a: u32, b: u32) void {
+    const left = find(component_of, a);
+    const right = find(component_of, b);
+    if (left == right) return;
+    // The lower index wins, which is what keeps the numbering above stable.
+    if (left < right) component_of[right] = left else component_of[left] = right;
+}
+
+fn buildComponent(
+    allocator: Allocator,
+    doc: *const Document,
+    rigid_of_node: []const ?Slot,
+    parent_of: []const ?u32,
+    component_of: []u32,
+    number: []const ?u32,
+    component: u32,
+    placements: []?SkinPlacement,
+    skeleton_index: u32,
+) Error!JointHierarchy {
     var is_joint: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, doc.nodes.len);
     defer is_joint.deinit(allocator);
     var member: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, doc.nodes.len);
     defer member.deinit(allocator);
-    for (skin.joints) |joint| {
-        is_joint.set(joint);
-        member.set(joint);
+
+    var joint_total: u32 = 0;
+    for (doc.skins, 0..) |skin, index| {
+        if (number[find(component_of, @intCast(index))].? != component) continue;
+        for (skin.joints) |joint| {
+            is_joint.set(joint);
+            member.set(joint);
+        }
+        joint_total += @intCast(skin.joints.len);
     }
 
-    for (skin.joints) |joint| {
+    for (0..doc.nodes.len) |node| {
+        if (!is_joint.isSet(node)) continue;
         // Intermediates count only where a joint ancestor exists. Without one
-        // the chain above is the static prefix, not slot data.
-        var above = parent_of[joint];
+        // the chain above is outside this skeleton.
+        var above = parent_of[node];
         while (above) |index| : (above = parent_of[index]) {
             if (is_joint.isSet(index)) break;
         } else continue;
-        above = parent_of[joint];
+        above = parent_of[node];
         while (!is_joint.isSet(above.?)) : (above = parent_of[above.?]) member.set(above.?);
     }
 
@@ -197,9 +415,15 @@ pub fn buildJointHierarchy(
     errdefer allocator.free(node_to_slot);
     @memset(node_to_slot, null);
 
+    var links: std.ArrayList(PrefixLink) = .empty;
+    errdefer links.deinit(allocator);
+
     var slots: SkinSlots = .{
         .doc = doc,
         .member = &member,
+        .rigid_of_node = rigid_of_node,
+        .links = &links,
+        .allocator = allocator,
         .slot_parent = slot_parent,
         .slot_prefix = slot_prefix,
         .bind_translations = bind_translations,
@@ -207,7 +431,7 @@ pub fn buildJointHierarchy(
         .bind_scales = bind_scales,
         .node_to_slot = node_to_slot,
     };
-    for (defaultSceneRoots(doc)) |root| slots.visit(root, no_parent);
+    for (defaultSceneRoots(doc)) |root| try slots.visit(root, no_parent);
 
     // A joint outside the default scene is never visited above, and a slot left
     // unassigned would be an uninitialized bind pose that a vertex still indexes
@@ -227,31 +451,53 @@ pub fn buildJointHierarchy(
     }
     std.debug.assert(slots.next == slot_count);
 
-    // Section 5.28.2: inverseBindMatrices is one MAT4 per joint, and validate.zig
-    // has already checked the component type, the shape and the count, so the
-    // read below cannot be short.
-    const inverse_bind = try allocator.alloc(zm.Mat, skin.joints.len);
+    const inverse_bind = try allocator.alloc(zm.Mat, joint_total);
     errdefer allocator.free(inverse_bind);
-    if (skin.inverse_bind_matrices) |accessor| {
-        const raw = try allocator.alloc([16]f32, skin.joints.len);
-        defer allocator.free(raw);
-        try doc.read([16]f32, accessor, raw);
-        // Section 5.25.4's storage again: column-major, which is the transpose
-        // of zmath's rows, so the sixteen floats read straight through.
-        for (inverse_bind, raw) |*matrix, m| matrix.* = .{
-            zm.f32x4(m[0], m[1], m[2], m[3]),
-            zm.f32x4(m[4], m[5], m[6], m[7]),
-            zm.f32x4(m[8], m[9], m[10], m[11]),
-            zm.f32x4(m[12], m[13], m[14], m[15]),
-        };
-    } else {
-        @memset(inverse_bind, zm.identity());
-    }
-
-    // Every joint is a member of the slot set, so every one of these is assigned.
-    const joint_slot = try allocator.alloc(u16, skin.joints.len);
+    const joint_slot = try allocator.alloc(u16, joint_total);
     errdefer allocator.free(joint_slot);
-    for (skin.joints, joint_slot) |joint, *slot| slot.* = node_to_slot[joint].?;
+
+    // The skins of this component, laid end to end in document order. Each one
+    // keeps its own joint numbering inside its run, which is what the vertex
+    // attribute indexes.
+    var written: u32 = 0;
+    for (doc.skins, 0..) |skin, index| {
+        if (number[find(component_of, @intCast(index))].? != component) continue;
+        if (skin.joints.len == 0) continue;
+
+        // Section 5.28.2: inverseBindMatrices is one MAT4 per joint, and
+        // validate.zig has already checked the component type, the shape and
+        // the count, so the read below cannot be short.
+        const run = inverse_bind[written..][0..skin.joints.len];
+        if (skin.inverse_bind_matrices) |accessor| {
+            const raw = try allocator.alloc([16]f32, skin.joints.len);
+            defer allocator.free(raw);
+            try doc.read([16]f32, accessor, raw);
+            // Section 5.25.4's storage again: column-major, which is the
+            // transpose of zmath's rows, so the sixteen floats read straight
+            // through.
+            for (run, raw) |*matrix, m| matrix.* = .{
+                zm.f32x4(m[0], m[1], m[2], m[3]),
+                zm.f32x4(m[4], m[5], m[6], m[7]),
+                zm.f32x4(m[8], m[9], m[10], m[11]),
+                zm.f32x4(m[12], m[13], m[14], m[15]),
+            };
+        } else {
+            @memset(run, zm.identity());
+        }
+
+        // Every joint is a member of the slot set, so every one of these is
+        // assigned.
+        for (skin.joints, joint_slot[written..][0..skin.joints.len]) |joint, *slot|
+            slot.* = node_to_slot[joint].?;
+
+        placements[index] = .{
+            .skeleton = skeleton_index,
+            .joint_offset = written,
+            .joint_count = @intCast(skin.joints.len),
+        };
+        written += @intCast(skin.joints.len);
+    }
+    std.debug.assert(written == joint_total);
 
     return .{
         .slot_parent = slot_parent,
@@ -262,19 +508,29 @@ pub fn buildJointHierarchy(
         .inverse_bind = inverse_bind,
         .joint_slot = joint_slot,
         .node_to_slot = node_to_slot,
+        .prefix_links = try links.toOwnedSlice(allocator),
     };
 }
 
-// The skeleton alone, for a caller that has no clips to rebase. An importer
-// keeps the hierarchy instead, because parsing the clips needs its node map.
+// The skeleton carrying one skin, for a caller that has no clips to rebase. An
+// importer keeps the whole build instead, because parsing the clips needs each
+// hierarchy's node map, and because a skeleton may carry several skins.
 pub fn parseSkeletonTemplate(
     allocator: Allocator,
     doc: *const Document,
     skin_index: u32,
 ) Error!?SkeletonTemplate {
-    var hierarchy = (try buildJointHierarchy(allocator, doc, skin_index)) orelse return null;
-    defer hierarchy.deinit(allocator);
-    return try SkeletonTemplate.init(allocator, hierarchy.templateInit());
+    if (skin_index >= doc.skins.len) return null;
+    const rigid_of_node = try allocator.alloc(?Slot, doc.nodes.len);
+    defer allocator.free(rigid_of_node);
+    @memset(rigid_of_node, null);
+    var built = try buildSkeletons(allocator, doc, rigid_of_node);
+    defer built.deinit(allocator);
+    const placement = built.placements[skin_index] orelse return null;
+    return try SkeletonTemplate.init(
+        allocator,
+        built.hierarchies[placement.skeleton].templateInit(),
+    );
 }
 
 // One clip, keeping the channels whose target node has a slot and rebasing them

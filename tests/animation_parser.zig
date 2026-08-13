@@ -93,12 +93,23 @@ const chain_skin =
     \\ "skins":[{"joints":[0,1],"inverseBindMatrices":5}]}
 ;
 
+// The rigid hierarchy's slot per node. Every test below but the last has no
+// node animation, so nothing above a skeleton moves and the map is empty.
+fn noRigidSlots(allocator: std.mem.Allocator, nodes: usize) ![]?resources.Slot {
+    const map = try allocator.alloc(?resources.Slot, nodes);
+    @memset(map, null);
+    return map;
+}
+
 test "animation parser: a skin becomes slots in topological order" {
     var doc = try load(chain_skin);
     defer doc.deinit();
 
-    var hierarchy = (try animation_parser.buildJointHierarchy(testing.allocator, &doc, 0)).?;
-    defer hierarchy.deinit(testing.allocator);
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+    const hierarchy = built.hierarchies[built.placements[0].?.skeleton];
 
     try testing.expectEqualSlices(resources.Slot, &.{ no_parent, 0 }, hierarchy.slot_parent);
     try testing.expectEqualSlices(u16, &.{ 0, 1 }, hierarchy.joint_slot);
@@ -120,8 +131,8 @@ test "animation parser: an index naming no skin is not a skeleton" {
     var doc = try load(chain_skin);
     defer doc.deinit();
     try testing.expectEqual(
-        @as(?animation_parser.JointHierarchy, null),
-        try animation_parser.buildJointHierarchy(testing.allocator, &doc, 1),
+        @as(?resources.SkeletonTemplate, null),
+        try animation_parser.parseSkeletonTemplate(testing.allocator, &doc, 1),
     );
 }
 
@@ -135,8 +146,11 @@ test "animation parser: a helper node between two joints keeps its slot" {
     );
     defer doc.deinit();
 
-    var hierarchy = (try animation_parser.buildJointHierarchy(testing.allocator, &doc, 0)).?;
-    defer hierarchy.deinit(testing.allocator);
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+    const hierarchy = built.hierarchies[built.placements[0].?.skeleton];
 
     try testing.expectEqual(@as(usize, 3), hierarchy.slot_parent.len);
     try testing.expectEqualSlices(resources.Slot, &.{ no_parent, 0, 1 }, hierarchy.slot_parent);
@@ -156,8 +170,11 @@ test "animation parser: a joint above the joint set is a static prefix" {
     );
     defer doc.deinit();
 
-    var hierarchy = (try animation_parser.buildJointHierarchy(testing.allocator, &doc, 0)).?;
-    defer hierarchy.deinit(testing.allocator);
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+    const hierarchy = built.hierarchies[built.placements[0].?.skeleton];
 
     try testing.expectEqual(@as(usize, 1), hierarchy.slot_parent.len);
     try expectVec(.{ 10, 0, 0, 1 }, hierarchy.slot_prefix[0][3]);
@@ -462,4 +479,165 @@ test "animation parser: a rotation spline keeps all four components of its tange
     const tangents = track.blend.cubicspline;
     try expectVec(.{ 1, 2, 3, 4 }, tangents[0].in);
     try expectVec(.{ 5, 6, 7, 8 }, tangents[0].out);
+}
+
+test "animation parser: skins whose joints share a tree become one skeleton" {
+    // Node 0 and 1 are skin zero's joints; node 2 hangs off node 1 and is skin
+    // one's only joint. That is `RecursiveSkeletons` in miniature: built per
+    // skin, skin one would end at node 2 and fold node 1's transform into a
+    // constant, so node 1's animation would never reach it.
+    var doc = try load(
+        \\ "nodes":[{"children":[1]},{"children":[2]},{}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "skins":[{"joints":[0,1]},{"joints":[2]}]}
+    );
+    defer doc.deinit();
+
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), built.hierarchies.len);
+
+    // Both skins land in it, laid end to end in document order, and each keeps
+    // its own joint numbering inside its run.
+    const first = built.placements[0].?;
+    const second = built.placements[1].?;
+    try testing.expectEqual(@as(u32, 0), first.skeleton);
+    try testing.expectEqual(@as(u32, 0), second.skeleton);
+    try testing.expectEqual(@as(u32, 0), first.joint_offset);
+    try testing.expectEqual(@as(u32, 2), first.joint_count);
+    try testing.expectEqual(@as(u32, 2), second.joint_offset);
+    try testing.expectEqual(@as(u32, 1), second.joint_count);
+
+    // The nested joint is inside the hierarchy rather than under a prefix, so
+    // the chain above it is slot data and moves with its animation.
+    const hierarchy = built.hierarchies[0];
+    try testing.expectEqualSlices(resources.Slot, &.{ no_parent, 0, 1 }, hierarchy.slot_parent);
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, hierarchy.joint_slot);
+}
+
+test "animation parser: skins that share no tree stay separate skeletons" {
+    // Two disjoint chains under one scene root that is not a joint. Merging
+    // them would pose unrelated geometry together and pay for slots neither
+    // skin reads.
+    var doc = try load(
+        \\ "nodes":[{"children":[1,2]},{},{}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "skins":[{"joints":[1]},{"joints":[2]}]}
+    );
+    defer doc.deinit();
+
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), built.hierarchies.len);
+    try testing.expectEqual(@as(u32, 0), built.placements[0].?.skeleton);
+    try testing.expectEqual(@as(u32, 1), built.placements[1].?.skeleton);
+    try testing.expectEqual(@as(u32, 0), built.placements[1].?.joint_offset);
+}
+
+test "animation parser: two meshes sharing one skin read the same run" {
+    var doc = try load(
+        \\ "nodes":[{"children":[1]},{}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "skins":[{"joints":[0,1]}]}
+    );
+    defer doc.deinit();
+
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+
+    // One skin, so the run is the whole skeleton and starts at zero. The
+    // property that matters is that a placement exists at all: a mesh with no
+    // placement has nothing to index.
+    try testing.expectEqual(@as(usize, 1), built.hierarchies.len);
+    try testing.expectEqual(@as(u32, 0), built.placements[0].?.joint_offset);
+    try testing.expectEqual(@as(u32, 2), built.placements[0].?.joint_count);
+}
+
+test "animation parser: a skeleton under an animated node links to it" {
+    // Node 0 moves and carries node 1, which is the skin's only joint. That is
+    // `BrainStem`: its eighteen joints hang below a node with 1309 keys, and
+    // baking that node's bind transform is the model animating its limbs while
+    // standing still.
+    var doc = try load(
+        \\ "nodes":[{"children":[1],"translation":[10,0,0]},{}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "skins":[{"joints":[1]}],
+        \\ "animations":[{"channels":[{"sampler":0,"target":{"node":0,"path":"translation"}}],
+        \\               "samplers":[{"input":0,"output":2,"interpolation":"LINEAR"}]}]}
+    );
+    defer doc.deinit();
+
+    // The rigid hierarchy's map, which is what the link points into. Node 0 is
+    // slotted there because a channel moves it.
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+    rigid[0] = 3;
+
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+
+    const hierarchy = built.hierarchies[0];
+    try testing.expectEqual(@as(usize, 1), hierarchy.prefix_links.len);
+    try testing.expectEqual(@as(resources.Slot, 0), hierarchy.prefix_links[0].slot);
+    try testing.expectEqual(@as(resources.Slot, 3), hierarchy.prefix_links[0].node_slot);
+
+    // And the moving node's transform is not in the baked prefix: it is the
+    // link's business now, so what stays behind is identity rather than the
+    // node's ten units of translation.
+    try expectVec(.{ 0, 0, 0, 1 }, hierarchy.slot_prefix[0][3]);
+}
+
+test "animation parser: a static chain above a skeleton is still baked" {
+    // The same shape with nothing animating node 0. Nothing to follow, so the
+    // transform folds in as it always did and no link is made.
+    var doc = try load(
+        \\ "nodes":[{"children":[1],"translation":[10,0,0]},{}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "skins":[{"joints":[1]}]}
+    );
+    defer doc.deinit();
+
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+
+    const hierarchy = built.hierarchies[0];
+    try testing.expectEqual(@as(usize, 0), hierarchy.prefix_links.len);
+    try expectVec(.{ 10, 0, 0, 1 }, hierarchy.slot_prefix[0][3]);
+}
+
+test "animation parser: only the chain below the moving node is baked" {
+    // Node 0 moves, node 1 is a static offset below it, node 2 is the joint.
+    // The link carries node 0 and the prefix keeps node 1, so the two compose
+    // to the whole chain without either being counted twice.
+    var doc = try load(
+        \\ "nodes":[{"children":[1]},{"children":[2],"translation":[0,4,0]},{}],
+        \\ "scenes":[{"nodes":[0]}],
+        \\ "skins":[{"joints":[2]}],
+        \\ "animations":[{"channels":[{"sampler":0,"target":{"node":0,"path":"translation"}}],
+        \\               "samplers":[{"input":0,"output":2,"interpolation":"LINEAR"}]}]}
+    );
+    defer doc.deinit();
+
+    const rigid = try noRigidSlots(testing.allocator, doc.nodes.len);
+    defer testing.allocator.free(rigid);
+    rigid[0] = 1;
+
+    var built = try animation_parser.buildSkeletons(testing.allocator, &doc, rigid);
+    defer built.deinit(testing.allocator);
+
+    const hierarchy = built.hierarchies[0];
+    try testing.expectEqual(@as(usize, 1), hierarchy.prefix_links.len);
+    try testing.expectEqual(@as(resources.Slot, 1), hierarchy.prefix_links[0].node_slot);
+    try expectVec(.{ 0, 4, 0, 1 }, hierarchy.slot_prefix[0][3]);
 }

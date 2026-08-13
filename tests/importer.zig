@@ -205,7 +205,9 @@ test "importer: skinned geometry stays in its own space" {
 
     try testing.expectEqual(@as(usize, 1), model.meshes.len);
     const mesh = model.meshes[0];
-    try testing.expectEqual(@as(?u32, 0), mesh.skin);
+    // Skeleton zero, and the whole of its joint run: one skin sharing it.
+    try testing.expectEqual(@as(u32, 0), mesh.skin.?.skeleton);
+    try testing.expectEqual(@as(u32, 0), mesh.skin.?.joint_offset);
     try testing.expectEqual(@as(?resources.Slot, null), mesh.anchor);
     try testing.expect(mesh.streams.skinned);
     // The node's translation is not baked in: the joint matrices carry it, and
@@ -213,7 +215,6 @@ test "importer: skinned geometry stays in its own space" {
     try expectVec3(.{ 0, 0, 0 }, mesh.vertices[0].position);
 
     try testing.expectEqual(@as(usize, 1), model.skins.len);
-    try testing.expectEqual(@as(u32, 0), model.skins[0].index);
     try testing.expectEqual(@as(usize, 0), model.skins[0].clips.len);
 }
 
@@ -240,7 +241,7 @@ test "importer: a skinned mesh on a driven node takes no anchor" {
     try testing.expectEqual(@as(usize, 1), animation.slotCount());
 
     try testing.expectEqual(@as(usize, 1), model.meshes.len);
-    try testing.expectEqual(@as(?u32, 0), model.meshes[0].skin);
+    try testing.expectEqual(@as(u32, 0), model.meshes[0].skin.?.skeleton);
     try testing.expectEqual(@as(?resources.Slot, null), model.meshes[0].anchor);
 }
 

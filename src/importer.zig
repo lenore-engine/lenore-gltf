@@ -330,7 +330,7 @@ fn buildImage(
 // space and is not a path: the model says which of the two a key is by whether
 // the image carries bytes, so the two never have to be told apart by spelling.
 fn embeddedKey(allocator: Allocator, index: usize) Error![]u8 {
-    return std.fmt.allocPrint(allocator, "embedded:{d}", .{index});
+    return allocator.print("embedded:{d}", .{index});
 }
 
 fn buildMaterials(
@@ -383,7 +383,7 @@ fn buildMaterial(
     const name = if (source.name) |declared|
         try allocator.dupe(u8, declared)
     else
-        try std.fmt.allocPrint(allocator, "material_{d}", .{index});
+        try allocator.print("material_{d}", .{index});
     errdefer allocator.free(name);
 
     var textures: MaterialInfo.TextureMaps = .{};

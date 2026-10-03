@@ -29,7 +29,7 @@ pub const Error = document.Error;
 pub const DynamicNodes = struct {
     // Dense over the document's nodes. The animation parser assigns a slot to
     // exactly this set, intersected with what the rendered scene reaches.
-    slotted: std.DynamicBitSetUnmanaged,
+    slotted: std.bit_set.Dynamic,
     // Dense over the document's nodes, and empty for every slotted one: a
     // slotted node's hold channels stay in the clip and pin its pose during
     // playback, so folding them in as well would apply them twice.
@@ -50,7 +50,7 @@ pub fn collect(allocator: Allocator, doc: *const Document) Error!DynamicNodes {
     // Targeted by a channel whose pose changes over time. With baking off,
     // every channel target counts, which is the same set the engine would carry
     // if nothing were ever folded in.
-    var changing: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, doc.nodes.len);
+    var changing: std.bit_set.Dynamic = try .initEmpty(allocator, doc.nodes.len);
     defer changing.deinit(allocator);
     for (doc.animations) |clip| {
         for (clip.channels) |channel| {
@@ -60,7 +60,7 @@ pub fn collect(allocator: Allocator, doc: *const Document) Error!DynamicNodes {
         }
     }
 
-    var slotted: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, doc.nodes.len);
+    var slotted: std.bit_set.Dynamic = try .initEmpty(allocator, doc.nodes.len);
     errdefer slotted.deinit(allocator);
     for (doc.scenes) |scene| {
         for (scene.nodes) |root| _ = markSlotted(doc, &changing, &slotted, root, false);
@@ -118,8 +118,8 @@ fn holdsAreBakeable(doc: *const Document) bool {
 // what the caller needs to decide the node above.
 fn markSlotted(
     doc: *const Document,
-    changing: *const std.DynamicBitSetUnmanaged,
-    slotted: *std.DynamicBitSetUnmanaged,
+    changing: *const std.bit_set.Dynamic,
+    slotted: *std.bit_set.Dynamic,
     node: u32,
     ancestor_changes: bool,
 ) bool {

@@ -382,7 +382,7 @@ test "document: a span that overflows u32 is still out of bounds" {
         \\ "bufferViews":[{"buffer":0,"byteOffset":4294967290,"byteLength":14}]}
     );
     defer view_case.deinit();
-    const eight = [_]u8{0} ** 8;
+    const eight: [8]u8 = @splat(0);
     try testing.expectError(
         error.BufferViewOutOfBounds,
         view_case.attachBuffers(&.{&eight}),
@@ -435,15 +435,15 @@ test "document: a rejected attachment binds no buffer at all" {
     );
     defer doc.deinit();
 
-    const first = [_]u8{1} ** 8;
-    const short_second = [_]u8{2} ** 4;
+    const first: [8]u8 = @splat(1);
+    const short_second: [4]u8 = @splat(2);
     try testing.expectError(
         error.BufferSizeMismatch,
         doc.attachBuffers(&.{ &first, &short_second }),
     );
     try testing.expectError(error.BuffersNotAttached, doc.bufferViewBytes(0));
 
-    const second = [_]u8{2} ** 16;
+    const second: [16]u8 = @splat(2);
     try doc.attachBuffers(&.{ &first, &second });
     try testing.expectEqual(@as(usize, 8), (try doc.bufferViewBytes(0)).len);
 }

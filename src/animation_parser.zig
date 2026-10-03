@@ -149,7 +149,7 @@ pub const JointHierarchy = struct {
 // pass, and resources.hierarchy.validate refuses a template without it.
 const SkinSlots = struct {
     doc: *const Document,
-    member: *const std.DynamicBitSetUnmanaged,
+    member: *const std.bit_set.Dynamic,
     // The rigid hierarchy's slot per node, for the chain above a root. Not to
     // be confused with `node_to_slot` below, which is this skeleton's own map
     // and is written rather than read.
@@ -261,7 +261,7 @@ pub fn buildSkeletons(
     // Every joint of every skin, and one skin that claims each. The claim is
     // arbitrary among the skins sharing a joint and is only used to name the
     // set a node belongs to.
-    var is_joint: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, doc.nodes.len);
+    var is_joint: std.bit_set.Dynamic = try .initEmpty(allocator, doc.nodes.len);
     defer is_joint.deinit(allocator);
     const claimed_by = try allocator.alloc(u32, doc.nodes.len);
     defer allocator.free(claimed_by);
@@ -371,9 +371,9 @@ fn buildComponent(
     placements: []?SkinPlacement,
     skeleton_index: u32,
 ) Error!JointHierarchy {
-    var is_joint: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, doc.nodes.len);
+    var is_joint: std.bit_set.Dynamic = try .initEmpty(allocator, doc.nodes.len);
     defer is_joint.deinit(allocator);
-    var member: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, doc.nodes.len);
+    var member: std.bit_set.Dynamic = try .initEmpty(allocator, doc.nodes.len);
     defer member.deinit(allocator);
 
     var joint_total: u32 = 0;
@@ -790,7 +790,7 @@ pub fn parseMorphWeights(
 // with hundreds of them.
 const NodeSlots = struct {
     doc: *const Document,
-    slotted: *const std.DynamicBitSetUnmanaged,
+    slotted: *const std.bit_set.Dynamic,
     held: []const node_transform.Held,
     node_to_slot: []?Slot,
     parent: []Slot,
@@ -932,7 +932,7 @@ fn assembleNodeAnimation(
         // translation, rotation and scale channels that share one slot, and it
         // yields the slots in ascending order, so the per-frame recompose loop
         // walks its arrays forwards.
-        var mask: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, slot_count);
+        var mask: std.bit_set.Dynamic = try .initEmpty(allocator, slot_count);
         defer mask.deinit(allocator);
         for (clip.channels) |channel| mask.set(channel.target_slot);
 
@@ -955,7 +955,7 @@ fn assembleNodeAnimation(
     };
 }
 
-fn countSlotted(doc: *const Document, slotted: *const std.DynamicBitSetUnmanaged, node: u32) usize {
+fn countSlotted(doc: *const Document, slotted: *const std.bit_set.Dynamic, node: u32) usize {
     var total: usize = @intFromBool(slotted.isSet(node));
     for (doc.nodes[node].children) |child| total += countSlotted(doc, slotted, child);
     return total;

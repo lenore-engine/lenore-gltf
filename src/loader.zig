@@ -238,7 +238,7 @@ pub fn readBeneath(
     // Zig 0.16 opens a no-follow Windows handle asynchronously, but returns it
     // with the synchronous flag. Correct the metadata so Threaded uses its APC
     // read path instead of issuing an invalid synchronous read on that handle.
-    if (builtin.os.tag == .windows) file.flags.nonblocking = true;
+    if (builtin.target.os.tag == .windows) file.flags.nonblocking = true;
 
     // Unlimited rather than the declared byte length: section 3.6.1.1 bounds a
     // view by that length and says nothing about the file, which an exporter is

@@ -115,6 +115,8 @@ pub const Mesh = struct {
 pub const Light = struct {
     source: types.Light,
     world: zm.Mat,
+    // World metres occupied by descendant fixture meshes at the loaded pose.
+    fixture_clearance: f32 = 0,
 };
 
 // One skeleton: a hierarchy and the clips rebased onto its slots.
@@ -640,6 +642,8 @@ const Builder = struct {
     node_to_morph: []const ?u32,
     // Dense over the document's skins, from the skeleton build.
     skin_placements: []const ?animation_parser.SkinPlacement,
+    parents: []const ?u32,
+    node_to_light: []?usize,
 
     // The scene walk anchors geometry to a slotted node, and the animation parser
     // gave a slot to exactly the slotted nodes the default scene reaches. Both
@@ -662,6 +666,7 @@ const Builder = struct {
         if (!node.visible) return false;
 
         if (self.doc.nodes[node.index].light) |light| {
+            self.node_to_light[node.index] = self.lights.items.len;
             try self.lights.append(self.allocator, .{
                 .source = self.doc.lights[light],
                 .world = node.world,
@@ -669,6 +674,7 @@ const Builder = struct {
         }
 
         const mesh = node.mesh orelse return true;
+        self.measureFixture(node, mesh);
         // Section 3.7.3.3: the node names the skin its primitives index. A skin
         // with no joints places nothing, and its geometry then draws rigid.
         const skin: ?animation_parser.SkinPlacement = if (self.doc.nodes[node.index].skin) |index|
@@ -718,6 +724,29 @@ const Builder = struct {
             try self.appendSeparate(node, primitive, material, skin, anchor, winding);
         }
         return true;
+    }
+
+    fn measureFixture(self: *Builder, node: scene_graph.Node, mesh: u32) void {
+        var ancestor = self.parents[node.index];
+        while (ancestor) |index| : (ancestor = self.parents[index]) {
+            const light_index = self.node_to_light[index] orelse continue;
+            const light = &self.lights.items[light_index];
+            if (light.source.kind == .directional) continue;
+            const position = scene_graph.transformPosition(.{ 0, 0, 0 }, light.world);
+            const direction = scene_graph.transformDirection(.{ 0, 0, -1 }, light.world);
+            for (self.parsed[mesh]) |primitive| {
+                for (primitive.vertices) |vertex| {
+                    const delta = scene_graph.transformPosition(vertex.position, node.world) - position;
+                    const depth = switch (light.source.kind) {
+                        .spot => @reduce(.Add, delta * direction),
+                        // Cube faces are world-axis aligned, regardless of the light's rotation.
+                        .point => @reduce(.Max, @abs(delta)),
+                        .directional => unreachable,
+                    };
+                    light.fixture_clearance = @max(light.fixture_clearance, depth);
+                }
+            }
+        }
     }
 
     fn appendSeparate(
@@ -804,6 +833,16 @@ fn buildGeometry(
     var lights: std.ArrayList(Light) = .empty;
     errdefer lights.deinit(allocator);
 
+    const parents = try allocator.alloc(?u32, doc.nodes.len);
+    defer allocator.free(parents);
+    @memset(parents, null);
+    for (doc.nodes, 0..) |node, index| {
+        for (node.children) |child| parents[child] = @intCast(index);
+    }
+    const node_to_light = try allocator.alloc(?usize, doc.nodes.len);
+    defer allocator.free(node_to_light);
+    @memset(node_to_light, null);
+
     var builder: Builder = .{
         .allocator = allocator,
         .doc = doc,
@@ -816,6 +855,8 @@ fn buildGeometry(
         .node_to_slot = node_to_slot,
         .node_to_morph = node_to_morph,
         .skin_placements = skin_placements,
+        .parents = parents,
+        .node_to_light = node_to_light,
     };
 
     // Section 3.5.1 leaves `scene` optional; scene zero is the choice made in

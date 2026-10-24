@@ -419,6 +419,7 @@ test "importer: a light carries the transform of the node that references it" {
 
     try testing.expectEqual(@as(usize, 1), model.lights.len);
     try testing.expectEqual(gltf.document.LightKind.point, model.lights[0].source.kind);
+    try testing.expectEqual(@as(f32, 0), model.lights[0].fixture_clearance);
     try testing.expectEqual([3]f32{ 1, 0, 0 }, model.lights[0].source.color);
     // The whole chain above the light, not just its own node.
     const world = model.lights[0].world;
@@ -698,4 +699,31 @@ test "importer: a mirrored node bakes reversed winding and the other handedness"
 
     // The mirror is in the geometry as well, not only in the index order.
     try testing.expectApproxEqAbs(@as(f32, -1.0), merged.vertices[1].position[0], 1e-6);
+}
+
+test "importer: fixture clearance uses descendant world vertices and the light kind" {
+    var doc = try load(one_triangle ++
+        \\ "extensionsUsed":["KHR_lights_punctual"],
+        \\ "extensions":{"KHR_lights_punctual":{"lights":[{"type":"spot","spot":{"outerConeAngle":0.7}},{"type":"point"}]}},
+        \\ "nodes":[{"translation":[10,20,30],"children":[1,5]},
+        \\          {"extensions":{"KHR_lights_punctual":{"light":0}},
+        \\           "rotation":[0,0.70710678,0,0.70710678],"scale":[2,3,4],"children":[2,4]},
+        \\          {"children":[3],"translation":[0,0,-0.1]},
+        \\          {"mesh":0,"scale":[0.01,0.02,1]},
+        \\          {"mesh":0,"translation":[0,0,1]},
+        \\          {"extensions":{"KHR_lights_punctual":{"light":1}},
+        \\           "rotation":[0,0,0.38268343,0.92387953],"children":[6]},
+        \\          {"mesh":0,"translation":[-0.3,-0.3,0.1],"scale":[0.1,0.1,1]},
+        \\          {"mesh":0,"translation":[100,100,100]},
+        \\          {"extensions":{"KHR_lights_punctual":{"light":0}}}],
+        \\ "scenes":[{"nodes":[0,7,8]}]}
+    );
+    defer doc.deinit();
+    var model = try importer.build(testing.allocator, &doc, "");
+    defer model.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 3), model.lights.len);
+    try testing.expectEqual(@as(f32, 0), model.lights[2].fixture_clearance);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), model.lights[0].fixture_clearance, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.3 * @sqrt(2.0)), model.lights[1].fixture_clearance, 1e-5);
 }
